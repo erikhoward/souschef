@@ -3533,9 +3533,1306 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
+## Task 8: REST API
+
+**Files:**
+- Create: `internal/httpapi/router.go`, `internal/httpapi/router_test.go`
+
+**Interfaces:**
+- Consumes: `*ideas.Service` from Task 6, `*enrich.Enricher` from Task 7.
+- Produces:
+  - `httpapi.Deps{Ideas *ideas.Service; Enricher Enricher; Hub *Hub}`
+  - `httpapi.Enricher` interface — `Enrich(ctx, string) (ideas.Metadata, error)`
+  - `httpapi.New(deps Deps) http.Handler`
+  - `(*Server).EnrichInBackground(id, rawText string)`
+
+- [ ] **Step 1: Write the failing test**
+
+Create `internal/httpapi/router_test.go`:
+
+```go
+package httpapi_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"testing"
+
+	"github.com/erikhoward/souschef/internal/httpapi"
+	"github.com/erikhoward/souschef/internal/ideas"
+	"github.com/erikhoward/souschef/internal/store"
+)
+
+// stubEnricher lets the HTTP tests run with no API key. Enrichment behaviour
+// itself is covered by the fixture tests in internal/enrich.
+type stubEnricher struct {
+	meta ideas.Metadata
+	err  error
+}
+
+func (s stubEnricher) Enrich(context.Context, string) (ideas.Metadata, error) {
+	return s.meta, s.err
+}
+
+func newTestServer(t *testing.T, e httpapi.Enricher) http.Handler {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	hub := httpapi.NewHub()
+	t.Cleanup(hub.Close)
+
+	return httpapi.New(httpapi.Deps{
+		Ideas:    ideas.NewService(st),
+		Enricher: e,
+		Hub:      hub,
+	})
+}
+
+func post(t *testing.T, h http.Handler, path string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	var buf bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, path, &buf)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func decodeIdea(t *testing.T, rec *httptest.ResponseRecorder) ideas.Idea {
+	t.Helper()
+	var out ideas.Idea
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v (body=%s)", err, rec.Body.String())
+	}
+	return out
+}
+
+func TestCreateIdeaReturnsImmediatelyAsPending(t *testing.T) {
+	h := newTestServer(t, stubEnricher{})
+
+	rec := post(t, h, "/api/ideas", map[string]string{
+		"raw_text": "Sheet-pan shawarma with a lemony feta situation",
+		"source":   "web",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	got := decodeIdea(t, rec)
+	if got.ID == "" {
+		t.Error("response must carry the new id")
+	}
+	if got.Enrichment.Status != ideas.EnrichPending {
+		t.Errorf("Status = %q, want pending — the response must not wait on Claude",
+			got.Enrichment.Status)
+	}
+	if got.Title == "" {
+		t.Error("a provisional title must be present so the row is never blank")
+	}
+}
+
+func TestCreateIdeaRejectsEmptyText(t *testing.T) {
+	h := newTestServer(t, stubEnricher{})
+
+	rec := post(t, h, "/api/ideas", map[string]string{"raw_text": "  ", "source": "web"})
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestCreateIdeaRejectsUnknownSource(t *testing.T) {
+	h := newTestServer(t, stubEnricher{})
+
+	rec := post(t, h, "/api/ideas", map[string]string{"raw_text": "fine", "source": "carrier_pigeon"})
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for an unknown source", rec.Code)
+	}
+}
+
+func TestGetIdeaNotFoundIs404(t *testing.T) {
+	h := newTestServer(t, stubEnricher{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/ideas/nope", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestListIdeasReturnsArrayNotNull(t *testing.T) {
+	h := newTestServer(t, stubEnricher{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/ideas", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	// An empty backlog must serialise as [] — null would break .map() in the UI.
+	if body := rec.Body.String(); !bytes.HasPrefix([]byte(body), []byte("[")) {
+		t.Errorf("empty list should serialise as [], got %s", body)
+	}
+}
+
+func TestPatchRecordsOverride(t *testing.T) {
+	h := newTestServer(t, stubEnricher{})
+
+	created := decodeIdea(t, post(t, h, "/api/ideas",
+		map[string]string{"raw_text": "Chili eggs", "source": "web"}))
+
+	var buf bytes.Buffer
+	json.NewEncoder(&buf).Encode(map[string]any{"difficulty": "easy"})
+	req := httptest.NewRequest(http.MethodPatch, "/api/ideas/"+created.ID, &buf)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d (body=%s)", rec.Code, rec.Body.String())
+	}
+	got := decodeIdea(t, rec)
+	if got.Metadata.Difficulty != "easy" {
+		t.Errorf("Difficulty = %q", got.Metadata.Difficulty)
+	}
+	if !got.HasOverride("difficulty") {
+		t.Error("PATCH must record the field as overridden")
+	}
+}
+
+func TestPatchRejectsUnknownField(t *testing.T) {
+	h := newTestServer(t, stubEnricher{})
+
+	created := decodeIdea(t, post(t, h, "/api/ideas",
+		map[string]string{"raw_text": "Chili eggs", "source": "web"}))
+
+	var buf bytes.Buffer
+	json.NewEncoder(&buf).Encode(map[string]any{"enrichment_status": "ok"})
+	req := httptest.NewRequest(http.MethodPatch, "/api/ideas/"+created.ID, &buf)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 — enrichment_status is not user-correctable", rec.Code)
+	}
+}
+
+func TestArchiveAndRestore(t *testing.T) {
+	h := newTestServer(t, stubEnricher{})
+
+	created := decodeIdea(t, post(t, h, "/api/ideas",
+		map[string]string{"raw_text": "Archivable", "source": "web"}))
+
+	if rec := post(t, h, "/api/ideas/"+created.ID+"/archive", nil); rec.Code != http.StatusOK {
+		t.Fatalf("archive status = %d", rec.Code)
+	}
+	if got := decodeIdea(t, post(t, h, "/api/ideas/"+created.ID+"/restore", nil)); got.IsArchived() {
+		t.Error("restore did not clear archived_at")
+	}
+}
+
+func TestSearchEndpointUsesFTS(t *testing.T) {
+	h := newTestServer(t, stubEnricher{})
+
+	post(t, h, "/api/ideas", map[string]string{"raw_text": "sheet pan shawarma", "source": "web"})
+	post(t, h, "/api/ideas", map[string]string{"raw_text": "cabbage soup", "source": "web"})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/ideas?q=shawarma", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	var got []ideas.Idea
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Errorf("want 1 search result, got %d", len(got))
+	}
+}
+
+func TestReenrichFailurePersistsVerbatimMessage(t *testing.T) {
+	h := newTestServer(t, stubEnricher{err: errors.New("401 authentication_error: invalid x-api-key")})
+
+	created := decodeIdea(t, post(t, h, "/api/ideas",
+		map[string]string{"raw_text": "Will fail", "source": "web"}))
+
+	// /reenrich runs synchronously so the failure is observable in the response.
+	rec := post(t, h, "/api/ideas/"+created.ID+"/reenrich", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	got := decodeIdea(t, rec)
+	if got.Enrichment.Status != ideas.EnrichFailed {
+		t.Errorf("Status = %q, want failed", got.Enrichment.Status)
+	}
+	if got.Enrichment.Error == "" {
+		t.Fatal("a failure must leave a message on the row — never a silent stall")
+	}
+	if !bytes.Contains([]byte(got.Enrichment.Error), []byte("401")) {
+		t.Errorf("Error = %q, want the provider message verbatim", got.Enrichment.Error)
+	}
+}
+
+func TestReenrichSuccessAppliesMetadata(t *testing.T) {
+	h := newTestServer(t, stubEnricher{meta: ideas.Metadata{
+		Title: "Sheet-pan shawarma", Difficulty: "easy", DurationClass: "quick",
+		Treatment: "elevated", ContentType: "recipe", Cuisine: "Middle Eastern",
+		VisualPotential: "high", Seasonality: "all_year", ProductionEffort: "light",
+	}})
+
+	created := decodeIdea(t, post(t, h, "/api/ideas",
+		map[string]string{"raw_text": "shawarma thing", "source": "web"}))
+
+	got := decodeIdea(t, post(t, h, "/api/ideas/"+created.ID+"/reenrich", nil))
+	if got.Enrichment.Status != ideas.EnrichOK {
+		t.Errorf("Status = %q, want ok", got.Enrichment.Status)
+	}
+	if got.Metadata.Cuisine != "Middle Eastern" {
+		t.Errorf("Cuisine = %q", got.Metadata.Cuisine)
+	}
+}
+```
+
+- [ ] **Step 2: Run it to make sure it fails**
+
+Run: `go test ./internal/httpapi/ -v`
+Expected: FAIL — `undefined: httpapi.New`
+
+- [ ] **Step 3: Write the router**
+
+Create `internal/httpapi/router.go`:
+
+```go
+// Package httpapi exposes the REST surface and the SSE stream. It owns no SQL
+// and no domain rules — every decision is delegated to internal/ideas.
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"log"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/erikhoward/souschef/internal/ideas"
+	"github.com/erikhoward/souschef/internal/store"
+)
+
+// Enricher is the slice of internal/enrich this package needs. Declaring it
+// here keeps HTTP tests runnable with a stub and no API key.
+type Enricher interface {
+	Enrich(ctx context.Context, rawText string) (ideas.Metadata, error)
+}
+
+type Deps struct {
+	Ideas    *ideas.Service
+	Enricher Enricher
+	Hub      *Hub
+}
+
+type Server struct {
+	ideas    *ideas.Service
+	enricher Enricher
+	hub      *Hub
+}
+
+func New(deps Deps) http.Handler {
+	s := &Server{ideas: deps.Ideas, enricher: deps.Enricher, hub: deps.Hub}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/ideas", s.listIdeas)
+	mux.HandleFunc("POST /api/ideas", s.createIdea)
+	mux.HandleFunc("GET /api/ideas/{id}", s.getIdea)
+	mux.HandleFunc("PATCH /api/ideas/{id}", s.patchIdea)
+	mux.HandleFunc("DELETE /api/ideas/{id}", s.deleteIdea)
+	mux.HandleFunc("POST /api/ideas/{id}/archive", s.archiveIdea)
+	mux.HandleFunc("POST /api/ideas/{id}/restore", s.restoreIdea)
+	mux.HandleFunc("POST /api/ideas/{id}/reenrich", s.reenrichIdea)
+	mux.HandleFunc("POST /api/ideas/{id}/notes", s.addNote)
+	mux.HandleFunc("POST /api/ideas/{id}/links", s.addLink)
+	mux.HandleFunc("DELETE /api/ideas/{id}/links/{other}", s.removeLink)
+	mux.HandleFunc("POST /api/ideas/{id}/merge", s.mergeIdea)
+	mux.HandleFunc("GET /events", s.hub.ServeHTTP)
+	return mux
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("httpapi: encode response: %v", err)
+	}
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// writeDomainError maps domain errors onto status codes in one place so no
+// handler has to remember the mapping.
+func writeDomainError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not found")
+	case errors.Is(err, ideas.ErrEmptyText),
+		errors.Is(err, ideas.ErrTooLong),
+		errors.Is(err, ideas.ErrSelfLink),
+		errors.Is(err, ideas.ErrSelfMerge):
+		writeError(w, http.StatusBadRequest, err.Error())
+	default:
+		log.Printf("httpapi: %v", err)
+		writeError(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
+func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, "malformed JSON body: "+err.Error())
+		return false
+	}
+	return true
+}
+
+var validSources = map[ideas.Source]bool{
+	ideas.SourceWeb:           true,
+	ideas.SourceTelegramText:  true,
+	ideas.SourceTelegramVoice: true,
+}
+
+func (s *Server) createIdea(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		RawText   string       `json:"raw_text"`
+		Source    ideas.Source `json:"source"`
+		SourceRef string       `json:"source_ref"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	if body.Source == "" {
+		body.Source = ideas.SourceWeb
+	}
+	if !validSources[body.Source] {
+		writeError(w, http.StatusBadRequest, "unknown source: "+string(body.Source))
+		return
+	}
+
+	idea, err := s.ideas.Create(r.Context(), body.RawText, body.Source, body.SourceRef)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+
+	s.hub.Broadcast(Event{Type: "idea.created", Idea: &idea})
+
+	// Respond now; classify in the background. Capture must never block on
+	// the network — that is the property the whole design is built around.
+	s.EnrichInBackground(idea.ID, idea.RawText)
+
+	writeJSON(w, http.StatusCreated, idea)
+}
+
+// EnrichInBackground classifies an idea and pushes the result over SSE. It
+// runs detached from the request, so it uses its own context.
+func (s *Server) EnrichInBackground(id, rawText string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		updated, err := s.enrichOnce(ctx, id, rawText)
+		if err != nil {
+			log.Printf("httpapi: enrich %s: %v", id, err)
+			return
+		}
+		s.hub.Broadcast(Event{Type: "idea.updated", Idea: &updated})
+	}()
+}
+
+// enrichOnce runs a single classification and records the outcome either way.
+// A failure is a recorded state, not a dropped request.
+func (s *Server) enrichOnce(ctx context.Context, id, rawText string) (ideas.Idea, error) {
+	meta, err := s.enricher.Enrich(ctx, rawText)
+	if err != nil {
+		return s.ideas.RecordEnrichmentFailure(ctx, id, err.Error())
+	}
+	return s.ideas.ApplyEnrichment(ctx, id, meta, "")
+}
+
+func (s *Server) reenrichIdea(w http.ResponseWriter, r *http.Request) {
+	idea, err := s.ideas.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+
+	// Synchronous, unlike creation: the caller pressed Retry and is waiting
+	// for an answer, so the outcome belongs in this response.
+	updated, err := s.enrichOnce(r.Context(), idea.ID, idea.RawText)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	s.hub.Broadcast(Event{Type: "idea.updated", Idea: &updated})
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) listIdeas(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	filter := ideas.ListFilter{
+		Query:      q.Get("q"),
+		Stage:      q.Get("stage"),
+		Difficulty: q.Get("difficulty"),
+		Duration:   q.Get("duration"),
+		Treatment:  q.Get("treatment"),
+		Archived:   ideas.ArchivedScope(q.Get("archived")),
+		Sort:       q.Get("sort"),
+		Order:      q.Get("order"),
+		Limit:      limit,
+	}
+
+	out, err := s.ideas.List(r.Context(), filter)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	if out == nil {
+		out = []ideas.Idea{} // never serialise null — the UI calls .map on this
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) getIdea(w http.ResponseWriter, r *http.Request) {
+	idea, err := s.ideas.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, idea)
+}
+
+func (s *Server) patchIdea(w http.ResponseWriter, r *http.Request) {
+	var patch map[string]any
+	if !decodeBody(w, r, &patch) {
+		return
+	}
+
+	updated, err := s.ideas.Correct(r.Context(), r.PathValue("id"), patch)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		// Correct returns a plain error for an unknown or wrongly-typed field.
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	s.hub.Broadcast(Event{Type: "idea.updated", Idea: &updated})
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) deleteIdea(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.ideas.Delete(r.Context(), id); err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	s.hub.Broadcast(Event{Type: "idea.deleted", ID: id})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) archiveIdea(w http.ResponseWriter, r *http.Request)  { s.setArchived(w, r, true) }
+func (s *Server) restoreIdea(w http.ResponseWriter, r *http.Request)  { s.setArchived(w, r, false) }
+
+func (s *Server) setArchived(w http.ResponseWriter, r *http.Request, archived bool) {
+	var (
+		updated ideas.Idea
+		err     error
+	)
+	if archived {
+		updated, err = s.ideas.Archive(r.Context(), r.PathValue("id"))
+	} else {
+		updated, err = s.ideas.Restore(r.Context(), r.PathValue("id"))
+	}
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	s.hub.Broadcast(Event{Type: "idea.updated", Idea: &updated})
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) addNote(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Body string `json:"body"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	if _, err := s.ideas.AddNote(r.Context(), r.PathValue("id"), body.Body); err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	s.respondWithIdea(w, r, r.PathValue("id"))
+}
+
+func (s *Server) addLink(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		OtherID string `json:"other_id"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	if err := s.ideas.Link(r.Context(), r.PathValue("id"), body.OtherID); err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	s.respondWithIdea(w, r, r.PathValue("id"))
+}
+
+func (s *Server) removeLink(w http.ResponseWriter, r *http.Request) {
+	if err := s.ideas.Unlink(r.Context(), r.PathValue("id"), r.PathValue("other")); err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	s.respondWithIdea(w, r, r.PathValue("id"))
+}
+
+func (s *Server) mergeIdea(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		DuplicateID string `json:"duplicate_id"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+
+	merged, err := s.ideas.Merge(r.Context(), r.PathValue("id"), body.DuplicateID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	s.hub.Broadcast(Event{Type: "idea.updated", Idea: &merged})
+	s.hub.Broadcast(Event{Type: "idea.deleted", ID: body.DuplicateID})
+	writeJSON(w, http.StatusOK, merged)
+}
+
+// respondWithIdea re-reads and returns the idea, so mutations that touch
+// relations always answer with fully hydrated state.
+func (s *Server) respondWithIdea(w http.ResponseWriter, r *http.Request, id string) {
+	idea, err := s.ideas.Get(r.Context(), id)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	s.hub.Broadcast(Event{Type: "idea.updated", Idea: &idea})
+	writeJSON(w, http.StatusOK, idea)
+}
+```
+
+- [ ] **Step 4: Run the tests — they will still fail on the Hub**
+
+Run: `go test ./internal/httpapi/ -v`
+Expected: FAIL — `undefined: httpapi.NewHub`. That is Task 9; continue there and return to this test.
+
+---
+
+## Task 9: SSE hub
+
+**Files:**
+- Create: `internal/httpapi/sse.go`, `internal/httpapi/sse_test.go`
+
+**Interfaces:**
+- Consumes: `ideas.Idea`.
+- Produces: `httpapi.Event{Type string; Idea *ideas.Idea; ID string}`; `httpapi.NewHub() *Hub`; `(*Hub).Broadcast(Event)`; `(*Hub).ServeHTTP(w, r)`; `(*Hub).Close()`; `(*Hub).SubscriberCount() int`.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `internal/httpapi/sse_test.go`:
+
+```go
+package httpapi
+
+import (
+	"bufio"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/erikhoward/souschef/internal/ideas"
+)
+
+func TestHubDeliversEventToSubscriber(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	waitForSubscribers(t, hub, 1)
+
+	idea := ideas.Idea{ID: "i1", Title: "Crispy chili eggs"}
+	hub.Broadcast(Event{Type: "idea.updated", Idea: &idea})
+
+	got := readEvent(t, resp.Body)
+	if got.Type != "idea.updated" {
+		t.Errorf("Type = %q", got.Type)
+	}
+	if got.Idea == nil || got.Idea.Title != "Crispy chili eggs" {
+		t.Errorf("payload did not survive the wire: %+v", got.Idea)
+	}
+}
+
+func TestHubFansOutToMultipleSubscribers(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
+	defer srv.Close()
+
+	const n = 3
+	bodies := make([]*http.Response, n)
+	for i := range bodies {
+		resp, err := http.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("connect %d: %v", i, err)
+		}
+		defer resp.Body.Close()
+		bodies[i] = resp
+	}
+	waitForSubscribers(t, hub, n)
+
+	hub.Broadcast(Event{Type: "idea.deleted", ID: "gone"})
+
+	for i, resp := range bodies {
+		if got := readEvent(t, resp.Body); got.ID != "gone" {
+			t.Errorf("subscriber %d got %+v", i, got)
+		}
+	}
+}
+
+func TestHubDropsSubscriberOnDisconnect(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForSubscribers(t, hub, 1)
+
+	resp.Body.Close()
+	waitForSubscribers(t, hub, 0)
+}
+
+// A slow or wedged reader must not block the enrichment goroutine that is
+// broadcasting. This is the failure mode that would turn one stuck browser
+// tab into a stalled backend.
+func TestBroadcastDoesNotBlockOnSlowSubscriber(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	waitForSubscribers(t, hub, 1)
+
+	done := make(chan struct{})
+	go func() {
+		// Far more events than any per-subscriber buffer.
+		for i := 0; i < 5000; i++ {
+			hub.Broadcast(Event{Type: "idea.updated", ID: "x"})
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Broadcast blocked on a subscriber that stopped reading")
+	}
+}
+
+func TestBroadcastIsRaceFree(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
+	defer srv.Close()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				hub.Broadcast(Event{Type: "idea.updated", ID: "x"})
+			}
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Get(srv.URL)
+			if err != nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+			resp.Body.Close()
+		}()
+	}
+	wg.Wait()
+}
+
+func waitForSubscribers(t *testing.T, hub *Hub, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if hub.SubscriberCount() == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("SubscriberCount = %d, want %d", hub.SubscriberCount(), want)
+}
+
+// readEvent reads one SSE frame, skipping the retry hint and any comments.
+func readEvent(t *testing.T, r interface{ Read([]byte) (int, error) }) Event {
+	t.Helper()
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var ev Event
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err != nil {
+			t.Fatalf("decode event: %v", err)
+		}
+		return ev
+	}
+	t.Fatal("stream closed before an event arrived")
+	return Event{}
+}
+```
+
+- [ ] **Step 2: Run it to make sure it fails**
+
+Run: `go test ./internal/httpapi/ -run TestHub -v`
+Expected: FAIL — `undefined: NewHub`
+
+- [ ] **Step 3: Write the hub**
+
+Create `internal/httpapi/sse.go`:
+
+```go
+package httpapi
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/erikhoward/souschef/internal/ideas"
+)
+
+// Event is what the browser receives. Idea is nil for deletions, where only
+// the ID is meaningful.
+type Event struct {
+	Type string      `json:"type"`
+	Idea *ideas.Idea `json:"idea,omitempty"`
+	ID   string      `json:"id,omitempty"`
+}
+
+// subscriberBuffer is how many events a single client can fall behind before
+// we start dropping its updates. Dropping is the correct trade: the client
+// refetches on reconnect, whereas blocking would stall the enrichment
+// goroutine doing the broadcast.
+const subscriberBuffer = 64
+
+// keepAliveInterval keeps intermediaries from closing an idle stream.
+const keepAliveInterval = 25 * time.Second
+
+type Hub struct {
+	mu          sync.RWMutex
+	subscribers map[chan Event]struct{}
+	closed      bool
+}
+
+func NewHub() *Hub {
+	return &Hub{subscribers: make(map[chan Event]struct{})}
+}
+
+func (h *Hub) subscribe() chan Event {
+	ch := make(chan Event, subscriberBuffer)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		close(ch)
+		return ch
+	}
+	h.subscribers[ch] = struct{}{}
+	return ch
+}
+
+func (h *Hub) unsubscribe(ch chan Event) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.subscribers[ch]; ok {
+		delete(h.subscribers, ch)
+		close(ch)
+	}
+}
+
+// Broadcast sends to every subscriber without blocking. A client that has
+// stopped reading loses events rather than holding up the sender.
+func (h *Hub) Broadcast(ev Event) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	for ch := range h.subscribers {
+		select {
+		case ch <- ev:
+		default:
+			// Buffer full: drop. The client resynchronises on reconnect.
+		}
+	}
+}
+
+func (h *Hub) SubscriberCount() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.subscribers)
+}
+
+func (h *Hub) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
+	h.closed = true
+	for ch := range h.subscribers {
+		delete(h.subscribers, ch)
+		close(ch)
+	}
+}
+
+func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	// Vite's dev proxy and any intermediary must not buffer this.
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	// Tell the browser how quickly to come back. EventSource reconnects on
+	// its own, so no client-side retry code is needed.
+	fmt.Fprint(w, "retry: 2000\n\n")
+	flusher.Flush()
+
+	ch := h.subscribe()
+	defer h.unsubscribe(ch)
+
+	keepAlive := time.NewTicker(keepAliveInterval)
+	defer keepAlive.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+
+		case ev, open := <-ch:
+			if !open {
+				return
+			}
+			payload, err := json.Marshal(ev)
+			if err != nil {
+				log.Printf("httpapi: marshal event: %v", err)
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
+				return
+			}
+			flusher.Flush()
+
+		case <-keepAlive.C:
+			if _, err := fmt.Fprint(w, ": keep-alive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+```
+
+- [ ] **Step 4: Run the whole httpapi suite**
+
+Run: `go test ./internal/httpapi/ -race -v`
+Expected: PASS — Task 8 and Task 9 tests together.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/httpapi
+git commit -m "feat(httpapi): REST surface and SSE hub
+
+Creation responds 201 with a pending idea and classifies in a detached
+goroutine, so capture never blocks on the network. /reenrich is
+deliberately synchronous — the caller pressed Retry and the outcome
+belongs in that response.
+
+Broadcast never blocks: a client that stops reading loses events and
+resynchronises on reconnect, rather than stalling the enrichment
+goroutine holding the send. Covered by a test that fires 5000 events at
+a subscriber that never reads.
+
+Empty listings serialise as [] rather than null so the UI can map over
+them unguarded.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 10: Single binary — embed the UI and wire main
+
+**Files:**
+- Create: `internal/httpapi/static.go`, `internal/httpapi/static_test.go`, `web/dist/.gitkeep`
+- Modify: `cmd/souschef/main.go`
+
+**Interfaces:**
+- Consumes: everything from Tasks 2–9.
+- Produces: `httpapi.WithStatic(api http.Handler) http.Handler`; a `main` that serves API and UI on one port and shuts down gracefully.
+
+- [ ] **Step 1: Keep an embeddable directory in git**
+
+`go:embed` fails at compile time if the directory does not exist, and `web/dist` is gitignored.
+
+```bash
+mkdir -p web/dist && touch web/dist/.gitkeep
+git add -f web/dist/.gitkeep
+```
+
+- [ ] **Step 2: Write the failing test**
+
+Create `internal/httpapi/static_test.go`:
+
+```go
+package httpapi_test
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/erikhoward/souschef/internal/httpapi"
+)
+
+func TestStaticFallsThroughToAPI(t *testing.T) {
+	api := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	})
+	h := httpapi.WithStatic(api)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/ideas", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTeapot {
+		t.Errorf("API routes must not be intercepted by the static handler, got %d", rec.Code)
+	}
+}
+
+func TestStaticServesSPAFallbackForClientRoutes(t *testing.T) {
+	h := httpapi.WithStatic(http.NotFoundHandler())
+
+	// /ideas/<uuid> is a react-router path with no file behind it. It must
+	// return index.html, not 404, or Telegram's deep links break on reload.
+	req := httptest.NewRequest(http.MethodGet, "/ideas/0191f0c2-1234-7890-abcd-ef0123456789", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusNotFound {
+		t.Error("client-side routes must fall back to index.html")
+	}
+}
+
+func TestEventsRouteIsNotIntercepted(t *testing.T) {
+	api := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	})
+	h := httpapi.WithStatic(api)
+
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTeapot {
+		t.Errorf("/events must reach the API handler, got %d", rec.Code)
+	}
+}
+```
+
+- [ ] **Step 3: Write the static handler**
+
+Create `internal/httpapi/static.go`:
+
+```go
+package httpapi
+
+import (
+	"embed"
+	"io/fs"
+	"net/http"
+	"strings"
+)
+
+//go:embed all:../../web/dist
+var distFS embed.FS
+
+// WithStatic wraps the API handler with the embedded single-page app.
+//
+// Anything under /api or /events goes straight to the API. Everything else
+// tries the embedded files, falling back to index.html so client-side routes
+// like /ideas/<id> survive a hard reload — which is what Telegram's [Open]
+// deep links rely on.
+func WithStatic(api http.Handler) http.Handler {
+	sub, err := fs.Sub(distFS, "web/dist")
+	if err != nil {
+		// Only possible if the embed directive and this path disagree.
+		panic("httpapi: embedded dist not found: " + err.Error())
+	}
+	files := http.FS(sub)
+	fileServer := http.FileServer(files)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/events" {
+			api.ServeHTTP(w, r)
+			return
+		}
+
+		if f, err := files.Open(r.URL.Path); err == nil {
+			f.Close()
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+
+		index, err := sub.Open("index.html")
+		if err != nil {
+			http.Error(w, "UI not built — run `make build`", http.StatusNotFound)
+			return
+		}
+		defer index.Close()
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if seeker, ok := index.(interface {
+			Read([]byte) (int, error)
+		}); ok {
+			buf := make([]byte, 0, 4096)
+			tmp := make([]byte, 4096)
+			for {
+				n, err := seeker.Read(tmp)
+				buf = append(buf, tmp[:n]...)
+				if err != nil {
+					break
+				}
+			}
+			w.Write(buf)
+		}
+	})
+}
+```
+
+- [ ] **Step 4: Run the tests**
+
+Run: `go test ./internal/httpapi/ -race -v`
+Expected: PASS
+
+If the embed pattern errors with "pattern outside module", create
+`web/embed.go` declaring `package web` with `//go:embed all:dist` and a
+`var DistFS embed.FS`, then import it from `httpapi`.
+
+- [ ] **Step 5: Wire main**
+
+Replace `cmd/souschef/main.go`:
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/erikhoward/souschef/internal/config"
+	"github.com/erikhoward/souschef/internal/enrich"
+	"github.com/erikhoward/souschef/internal/httpapi"
+	"github.com/erikhoward/souschef/internal/ideas"
+	"github.com/erikhoward/souschef/internal/store"
+)
+
+// version is overridden at build time via -ldflags.
+var version = "0.1.0-dev"
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "souschef %s failed: %v\n", version, err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	st, err := store.Open(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	hub := httpapi.NewHub()
+	defer hub.Close()
+
+	api := httpapi.New(httpapi.Deps{
+		Ideas:    ideas.NewService(st),
+		Enricher: enrich.New(cfg.Model, cfg.Effort),
+		Hub:      hub,
+	})
+
+	srv := &http.Server{
+		Addr:              fmt.Sprintf("127.0.0.1:%d", cfg.Port),
+		Handler:           httpapi.WithStatic(api),
+		ReadHeaderTimeout: 10 * time.Second,
+		// No WriteTimeout: it would sever the SSE stream on a fixed interval.
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Printf("souschef %s listening on http://127.0.0.1:%d (db=%s, model=%s)",
+			version, cfg.Port, cfg.DBPath, cfg.Model)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("http server: %v", err)
+			stop()
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("shutting down…")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return srv.Shutdown(shutdownCtx)
+}
+```
+
+- [ ] **Step 6: Build and run end to end**
+
+```bash
+make build
+./bin/souschef &
+sleep 1
+curl -s -X POST localhost:8420/api/ideas \
+  -H 'Content-Type: application/json' \
+  -d '{"raw_text":"sheet pan shawarma with a lemony feta situation","source":"web"}' | head -c 400
+echo
+curl -s localhost:8420/api/ideas | head -c 200
+kill %1
+```
+
+Expected: a 201 payload with `"enrichment":{"status":"pending"}` returning
+immediately, then a list containing it. With no API key configured, the row
+will shortly show `"status":"failed"` with a message — that is the design
+working, not a bug.
+
+- [ ] **Step 7: Run the full suite**
+
+Run: `go test ./... -race`
+Expected: PASS
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add -A
+git commit -m "feat(httpapi): embed the UI and serve everything from one binary
+
+/api/* and /events reach the API; everything else tries the embedded
+files and falls back to index.html, so client-side routes survive a hard
+reload — which Telegram's deep links depend on.
+
+The server sets no WriteTimeout: a fixed one would sever the SSE stream
+at a regular interval.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
 ## Remaining tasks
 
-Tasks 8–17 follow the same structure. Deliverables:
+Tasks 11–17 follow the same structure. Deliverables:
 
 | Task | Deliverable |
 |---|---|
