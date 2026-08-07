@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -40,6 +41,41 @@ func NewClient(token string) *Client {
 	}
 }
 
+// redactedError carries a scrubbed message while keeping the original error
+// reachable through Unwrap, so errors.Is/As still work on whatever the
+// transport returned — bot.Run's cancellation check depends on that.
+type redactedError struct {
+	msg string
+	err error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.err }
+
+// redact scrubs the bot token out of an error before it can escape the client.
+//
+// Every URL this client builds embeds the token (.../bot<TOKEN>/<method>), and
+// on a transport failure http.Client.Do returns a *url.Error whose Error()
+// prints that URL verbatim. Those errors reach the log on every network blip —
+// a closed laptop lid is enough — and, worse, handleVoice sends err.Error()
+// into the chat as message text, persisting the token into the chat history.
+// A leaked bot token is full control of the bot, so no raw error is allowed
+// out of call() or DownloadFile.
+//
+// The API-level path (a 401 rendering as "getMyCommands failed: 401
+// Unauthorized") never contained the URL and is unaffected; passing it through
+// here too is simply cheaper than reasoning about which paths are safe.
+func (c *Client) redact(err error) error {
+	if err == nil || c.token == "" {
+		return err
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, c.token) {
+		return err
+	}
+	return &redactedError{msg: strings.ReplaceAll(msg, c.token, "<redacted>"), err: err}
+}
+
 type apiResponse struct {
 	OK          bool            `json:"ok"`
 	Result      json.RawMessage `json:"result"`
@@ -47,7 +83,14 @@ type apiResponse struct {
 	ErrorCode   int             `json:"error_code"`
 }
 
+// call issues one Bot API request. Every error it returns passes through
+// redact: the request URL embeds the token, so a raw transport error is a
+// credential leak.
 func (c *Client) call(ctx context.Context, method string, payload, out any) error {
+	return c.redact(c.doCall(ctx, method, payload, out))
+}
+
+func (c *Client) doCall(ctx context.Context, method string, payload, out any) error {
 	var body io.Reader
 	if payload != nil {
 		buf, err := json.Marshal(payload)
@@ -212,6 +255,11 @@ func (c *Client) GetFile(ctx context.Context, fileID string) (string, error) {
 // DownloadFile resolves a file_id and writes the bytes into dir, returning the
 // local path.
 func (c *Client) DownloadFile(ctx context.Context, fileID, dir string) (string, error) {
+	path, err := c.doDownloadFile(ctx, fileID, dir)
+	return path, c.redact(err)
+}
+
+func (c *Client) doDownloadFile(ctx context.Context, fileID, dir string) (string, error) {
 	filePath, err := c.GetFile(ctx, fileID)
 	if err != nil {
 		return "", err
