@@ -234,6 +234,45 @@ func TestListSortsDifficultySemanticallyNotAlphabetically(t *testing.T) {
 	}
 }
 
+func TestNilSlicesPersistAsEmptyArraysNotNull(t *testing.T) {
+	s, ctx := newTestStore(t), context.Background()
+
+	idea := fixtureIdea("i1", "Bare idea")
+	idea.Metadata.Equipment = nil
+	idea.FieldOverrides = nil
+	if err := s.InsertIdea(ctx, idea); err != nil {
+		t.Fatal(err)
+	}
+
+	// Raw column values must be the JSON empty array, never the literal
+	// "null" string — a later task's React UI maps over these fields
+	// without a null guard.
+	var equipmentCol, overridesCol string
+	err := s.DB().QueryRow(
+		`SELECT equipment, field_overrides FROM ideas WHERE id = ?`, "i1",
+	).Scan(&equipmentCol, &overridesCol)
+	if err != nil {
+		t.Fatalf("query raw columns: %v", err)
+	}
+	if equipmentCol != "[]" {
+		t.Errorf("equipment column = %q, want %q", equipmentCol, "[]")
+	}
+	if overridesCol != "[]" {
+		t.Errorf("field_overrides column = %q, want %q", overridesCol, "[]")
+	}
+
+	got, err := s.GetIdea(ctx, "i1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata.Equipment == nil || len(got.Metadata.Equipment) != 0 {
+		t.Errorf("Metadata.Equipment = %#v, want non-nil empty slice", got.Metadata.Equipment)
+	}
+	if got.FieldOverrides == nil || len(got.FieldOverrides) != 0 {
+		t.Errorf("FieldOverrides = %#v, want non-nil empty slice", got.FieldOverrides)
+	}
+}
+
 func TestDeleteIdea(t *testing.T) {
 	s, ctx := newTestStore(t), context.Background()
 

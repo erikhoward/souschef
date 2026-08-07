@@ -21,8 +21,14 @@ const ideaColumns = `
 	enrichment_status, enrichment_error, enrichment_model, enriched_at,
 	created_at, updated_at`
 
-func encodeJSON(v any) (string, error) {
-	if v == nil {
+// encodeJSON marshals a string slice for storage. It takes []string rather
+// than any so a nil or empty slice reliably encodes as "[]": a nil slice
+// boxed into an any parameter is a non-nil interface value, which defeats a
+// `v == nil` check and lets json.Marshal write the 4-byte string "null"
+// instead. Callers must never see that — the frontend maps over these
+// fields without a null guard.
+func encodeJSON(v []string) (string, error) {
+	if len(v) == 0 {
 		return "[]", nil
 	}
 	b, err := json.Marshal(v)
@@ -272,6 +278,9 @@ func scanIdea(sc scanner) (ideas.Idea, error) {
 		VisualPotential:   visual.String,
 		Seasonality:       seasonality.String,
 		ProductionEffort:  effort.String,
+	}
+	if i.Metadata.Equipment == nil {
+		i.Metadata.Equipment = []string{}
 	}
 
 	i.FieldOverrides = decodeStrings(overrides)
