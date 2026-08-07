@@ -1,19 +1,44 @@
 # Sous Chef
 
-A local-first recipe content pipeline for capturing ideas, shaping them into briefs, reviewing recipes, and moving content toward a short-form video script.
+A local-first pipeline for capturing recipe and video ideas, inferring their
+metadata with Claude, and organising the backlog. Capture from a web app or
+from Telegram, by text or by voice.
 
-## Run locally
+## Prerequisites
+
+- Go 1.26+
+- Bun 1.3+
+- An Anthropic credential — either `ANTHROPIC_API_KEY` or an `ant auth login` profile
+- A Telegram bot token from [@BotFather](https://t.me/botfather)
+- whisper.cpp, for voice notes:
 
 ```bash
-bun install
-bun run dev
+brew install whisper-cpp
+mkdir -p models
+curl -fsSL -o models/ggml-base.en.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
 ```
 
-## Included MVP flow
+## Setup
 
-- Capture ideas in natural language with inferred creation metadata.
-- Search, filter, archive, restore, delete, merge, and link related ideas.
-- Progress ideas through brief, recipe-review, and script-ready workflow stages.
-- Review a structured recipe, record test status, approve it, and open the next script stage.
+```bash
+cp .env.example .env   # then fill in the values
+make build
+./bin/souschef
+```
 
-This local UI uses seeded data and deterministic metadata inference. Telegram capture, persisted storage, AI model calls, and export formats are the next implementation layer.
+The app refuses to start if anything is missing, and names what. Open
+http://localhost:8420.
+
+## Development
+
+```bash
+make dev    # Go on :8420, Vite on :5173 with hot reload
+make test   # Go tests plus Playwright
+```
+
+## Telegram
+
+The token is all BotFather needs to provide — **the app publishes its own
+command list** on startup. Send it a message or a voice note to capture an
+idea, and `/s <query>` to search.
