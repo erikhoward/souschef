@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/erikhoward/souschef/internal/ideas"
@@ -448,15 +449,141 @@ func TestMergeUnionsAndTombstones(t *testing.T) {
 		t.Errorf("merge should inherit the duplicate's links, got %v", merged.LinkedIDs)
 	}
 
+	// The duplicate's id must still resolve — and resolve to the primary,
+	// not to the dead record. That is what the tombstone exists for.
 	tomb, err := svc.Get(ctx, dup.ID)
 	if err != nil {
 		t.Fatalf("tombstone must still resolve: %v", err)
 	}
-	if tomb.MergedIntoID == nil || *tomb.MergedIntoID != primary.ID {
-		t.Error("duplicate must be tombstoned pointing at the primary")
+	if tomb.ID != primary.ID {
+		t.Errorf("Get(duplicate).ID = %q, want the primary %q", tomb.ID, primary.ID)
 	}
 
 	if _, err := svc.Merge(ctx, primary.ID, primary.ID); err == nil {
 		t.Error("merging an idea into itself must fail")
 	}
+}
+
+// tombstone points a at b directly, bypassing Merge — which refuses the
+// degenerate shapes these tests need to construct.
+func tombstone(t *testing.T, svc *ideas.Service, ctx context.Context, a ideas.Idea, targetID string) {
+	t.Helper()
+	a.MergedIntoID = &targetID
+	if err := svc.Save(ctx, a); err != nil {
+		t.Fatalf("Save tombstone: %v", err)
+	}
+}
+
+// Spec §6 promises merged tombstones are both excluded from lists and
+// resolved on direct fetch. Exclusion alone is not enough: an old Telegram
+// [Open] link, or a link from another idea, points at the duplicate's id and
+// must land on the surviving idea.
+func TestGetResolvesAMergedTombstoneToItsPrimary(t *testing.T) {
+	svc, ctx := newService(t)
+
+	primary, _ := svc.Create(ctx, "Surviving idea", ideas.SourceWeb, "")
+	dup, _ := svc.Create(ctx, "Duplicate idea", ideas.SourceWeb, "")
+
+	if _, err := svc.Merge(ctx, primary.ID, dup.ID); err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+
+	got, err := svc.Get(ctx, dup.ID)
+	if err != nil {
+		t.Fatalf("Get(duplicate): %v", err)
+	}
+	if got.ID != primary.ID {
+		t.Errorf("Get(duplicate).ID = %q, want the primary %q", got.ID, primary.ID)
+	}
+	if got.Title != primary.Title {
+		t.Errorf("Title = %q, want the primary's %q", got.Title, primary.Title)
+	}
+	if got.MergedIntoID != nil {
+		t.Error("the resolved idea must be the primary itself, not another tombstone")
+	}
+}
+
+// Merging B into A and later A into C is legitimate, and the oldest link must
+// still land on the idea that is actually alive.
+func TestGetFollowsAChainOfMerges(t *testing.T) {
+	svc, ctx := newService(t)
+
+	first, _ := svc.Create(ctx, "First", ideas.SourceWeb, "")
+	second, _ := svc.Create(ctx, "Second", ideas.SourceWeb, "")
+	third, _ := svc.Create(ctx, "Third", ideas.SourceWeb, "")
+
+	if _, err := svc.Merge(ctx, second.ID, first.ID); err != nil {
+		t.Fatalf("Merge first into second: %v", err)
+	}
+	if _, err := svc.Merge(ctx, third.ID, second.ID); err != nil {
+		t.Fatalf("Merge second into third: %v", err)
+	}
+
+	got, err := svc.Get(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("Get(first): %v", err)
+	}
+	if got.ID != third.ID {
+		t.Errorf("Get(first).ID = %q, want the surviving idea %q", got.ID, third.ID)
+	}
+}
+
+// A cycle is unreachable through Merge, but a corrupted row must never hang a
+// fetch. Get must terminate and return a real idea.
+func TestGetSurvivesCyclicAndSelfReferentialTombstones(t *testing.T) {
+	t.Run("self-referential", func(t *testing.T) {
+		svc, ctx := newService(t)
+		idea, _ := svc.Create(ctx, "Points at itself", ideas.SourceWeb, "")
+		tombstone(t, svc, ctx, idea, idea.ID)
+
+		done := make(chan struct{})
+		var got ideas.Idea
+		var err error
+		go func() {
+			got, err = svc.Get(ctx, idea.ID)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Get did not terminate on a self-referential tombstone")
+		}
+
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got.ID != idea.ID {
+			t.Errorf("ID = %q, want the idea itself %q", got.ID, idea.ID)
+		}
+	})
+
+	t.Run("two-idea cycle", func(t *testing.T) {
+		svc, ctx := newService(t)
+		a, _ := svc.Create(ctx, "A", ideas.SourceWeb, "")
+		b, _ := svc.Create(ctx, "B", ideas.SourceWeb, "")
+		tombstone(t, svc, ctx, a, b.ID)
+		tombstone(t, svc, ctx, b, a.ID)
+
+		done := make(chan struct{})
+		var got ideas.Idea
+		var err error
+		go func() {
+			got, err = svc.Get(ctx, a.ID)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Get did not terminate on a cyclic tombstone chain")
+		}
+
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		// Either end of the cycle is a defensible answer; the contract is
+		// that Get returns a real idea instead of looping forever.
+		if got.ID != a.ID && got.ID != b.ID {
+			t.Errorf("ID = %q, want one of the two ideas in the cycle", got.ID)
+		}
+	})
 }

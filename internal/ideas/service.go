@@ -137,12 +137,50 @@ func (s *Service) Create(ctx context.Context, rawText string, source Source, sou
 	return idea, nil
 }
 
-// Get returns an idea with its notes and links populated.
+// maxMergeHops caps how far Get follows a chain of merges. Merging B into A
+// and later A into C is legitimate and should resolve; a chain longer than
+// this is a data problem, not a usage pattern, and must not turn a fetch into
+// an unbounded walk.
+const maxMergeHops = 8
+
+// Get returns an idea with its notes and links populated, resolving a merged
+// tombstone to the idea it was merged into.
+//
+// Resolution is the entire reason Merge leaves a tombstone instead of
+// deleting the duplicate (spec §4): an old Telegram message or an existing
+// link must still resolve to something useful. Excluding tombstones from
+// lists without resolving them on direct fetch delivers only half of that —
+// the link opens, and shows a dead record.
 func (s *Service) Get(ctx context.Context, id string) (Idea, error) {
 	idea, err := s.repo.GetIdea(ctx, id)
 	if err != nil {
 		return Idea{}, err
 	}
+
+	// A cycle (A→B→A, or a self-reference) is not reachable through Merge,
+	// which refuses to merge an idea into itself — but a corrupted row must
+	// not hang a fetch, so the walk tracks what it has seen and stops on a
+	// repeat. Both guards return the last idea that did resolve rather than
+	// an error: a stale-but-real idea is more use to someone following an
+	// old link than a failure.
+	seen := map[string]bool{idea.ID: true}
+	for hops := 0; idea.MergedIntoID != nil && hops < maxMergeHops; hops++ {
+		next := *idea.MergedIntoID
+		if seen[next] {
+			break
+		}
+		primary, err := s.repo.GetIdea(ctx, next)
+		if err != nil {
+			// The primary is unreadable — a dangling pointer the schema's
+			// ON DELETE SET NULL should make unreachable. Stop and return the
+			// tombstone. This does not swallow a genuine store failure: the
+			// hydrate call below queries the same store and surfaces it.
+			break
+		}
+		seen[next] = true
+		idea = primary
+	}
+
 	return s.hydrate(ctx, idea)
 }
 
