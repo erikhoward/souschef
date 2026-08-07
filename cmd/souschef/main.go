@@ -38,8 +38,29 @@ func main() {
 	}
 }
 
+// workingDir names the directory the process is running from, so a "no .env
+// found" message points at where it looked rather than leaving you to guess.
+func workingDir() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "the working directory"
+	}
+	return dir
+}
+
 func run() error {
 	cfg, err := config.Load()
+
+	// Report where configuration came from BEFORE handling the error. This is
+	// most valuable on the failure path: a .env sitting unread beside a process
+	// complaining "TELEGRAM_BOT_TOKEN is required" is a confusing five minutes,
+	// and knowing the file was never opened ends it immediately.
+	if cfg.LoadedDotEnv {
+		log.Println("config: loaded .env from the working directory")
+	} else {
+		log.Printf("config: no .env found in %s — using the ambient environment", workingDir())
+	}
+
 	if err != nil {
 		return err
 	}

@@ -8,10 +8,14 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/joho/godotenv"
 )
 
 type Config struct {
@@ -25,6 +29,37 @@ type Config struct {
 	WhisperBin     string
 	WhisperModel   string
 	AudioDir       string
+
+	// LoadedDotEnv reports whether a .env file in the working directory was
+	// read. Callers surface this at startup so it is obvious which source the
+	// configuration came from — a .env sitting unread next to a failing
+	// process is exactly the confusion this field exists to prevent.
+	LoadedDotEnv bool
+}
+
+// dotEnvFile is read from the process's working directory, which is why the
+// README tells you to run the binary from the repo root: WHISPER_MODEL,
+// SOUSCHEF_DB_PATH and AUDIO_DIR are all relative paths resolved the same way.
+const dotEnvFile = ".env"
+
+// loadDotEnv reads .env into the environment if it exists. Values already
+// present in the environment WIN — godotenv.Load does not overwrite them —
+// so an inline `SOUSCHEF_PORT=9999 ./bin/souschef` still overrides the file,
+// which is what the test suite and the Playwright config rely on.
+//
+// A missing file is not an error: every automated run in this project supplies
+// configuration inline. A file that exists but cannot be parsed IS an error —
+// silently ignoring a typo'd .env would strand you exactly as an unread one does.
+func loadDotEnv() (bool, error) {
+	err := godotenv.Load(dotEnvFile)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s exists but could not be parsed: %w", dotEnvFile, err)
+	}
 }
 
 func env(key, def string) string {
@@ -38,7 +73,13 @@ func env(key, def string) string {
 // every problem it finds at once rather than stopping at the first, so a fresh
 // checkout surfaces all missing setup in a single run.
 func Load() (Config, error) {
+	loadedDotEnv, err := loadDotEnv()
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
+		LoadedDotEnv:  loadedDotEnv,
 		AnthropicKey:  os.Getenv("ANTHROPIC_API_KEY"),
 		Model:         env("SOUSCHEF_MODEL", "claude-sonnet-5"),
 		Effort:        env("SOUSCHEF_EFFORT", "low"),
