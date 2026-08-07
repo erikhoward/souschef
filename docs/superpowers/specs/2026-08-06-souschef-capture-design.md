@@ -118,7 +118,7 @@ The same binary is what goes into a container when cloud deployment is wanted la
 | `ideas` | Domain rules | Takes a `store`, returns domain errors |
 | `enrich` | Claude call, schema validation, retry | **Never touches the database** |
 | `transcribe` | whisper.cpp subprocess | Returns text or a typed error |
-| `telegram` | Long-poll loop, command routing | Calls `ideas` and `enrich`; owns no SQL |
+| `telegram` | Command registry, menu sync, long-poll loop, routing | Calls `ideas` and `enrich`; owns no SQL |
 | `httpapi` | Routes, JSON, SSE hub, embedded assets | Calls `ideas`; owns no SQL |
 
 Two boundaries are enforced deliberately:
@@ -320,6 +320,42 @@ No ID is ever displayed, copied, or pasted. This is the specific defect being co
 
 Creation and search are the only Telegram capabilities in this phase, per the original brief. Archiving, editing, merging, and linking are deliberately web-only — `retry` is included because it belongs to making capture reliable rather than being a new capability, and `/recent` is a search convenience over the same index.
 
+### The app is the source of truth for commands
+
+Commands are **defined in Go and published to Telegram by the application**. BotFather is used only to create the bot and issue a token; the command list is never configured by hand there.
+
+A single registry in `internal/telegram` binds each command's name, its user-facing description, and its handler in one place:
+
+```go
+var Commands = []Command{
+    {Name: "s",      Args: "<query>", Desc: "Search your ideas",        Handler: handleSearch},
+    {Name: "recent", Args: "",        Desc: "Show your ten newest ideas", Handler: handleRecent},
+    {Name: "help",   Args: "",        Desc: "What this bot can do",     Handler: handleHelp},
+}
+```
+
+Everything downstream is derived from that slice:
+
+- **The Telegram menu**, via `setMyCommands` at startup.
+- **The router.** Incoming updates dispatch by looking up `Name` in the registry. An unknown command replies with the help text rather than being silently swallowed.
+- **`/help` output**, rendered from `Desc` and `Args`. It cannot fall out of date with the menu, because both read the same field.
+
+This makes the menu-versus-handler drift structurally impossible. A command that appears in Telegram's UI but does nothing, or a working command nobody can discover, both require editing the registry to create — and neither compiles, because `Handler` has no zero value that type-checks.
+
+**Sync behavior at startup:**
+
+1. Call `getMyCommands` for the configured scope.
+2. Compare against the registry, normalized and order-independent.
+3. Only if they differ, call `setMyCommands` and log what changed.
+
+The compare-first step keeps a no-op restart from writing to Telegram's API, and turns an actual change into a visible log line rather than a silent overwrite. Sync failure is logged as a warning and does **not** prevent startup: a stale command menu degrades discoverability, while refusing to boot would take away capture entirely — the wrong trade for this system.
+
+**Scope.** Commands publish with `BotCommandScopeChat` for `TELEGRAM_ALLOWED_CHAT_ID`, so they are only offered in the one chat that is allowed to use the bot, rather than to every user who happens to find it.
+
+**Validation** runs against Telegram's constraints when the registry is built, so a malformed entry fails at startup rather than at the API call: names are 1–32 characters of lowercase letters, digits, and underscores; descriptions are 3–256 characters. `Args` is documentation only — Telegram has no parameter syntax — and appears in `/help`, not in `setMyCommands`.
+
+Callback actions (`open`, `retry`) are deliberately *not* in the registry. They arrive as `callback_data` on inline keyboards, never as typed commands, and Telegram has no menu concept for them.
+
 ---
 
 ## 8. Frontend
@@ -369,6 +405,7 @@ The thumbnail column loses its fabricated food photography. It is replaced with 
 | `store` | Real SQLite in a temp file (not `:memory:` — FTS5 triggers must survive a reopen), migrations applied fresh per test. Includes a migrations-run-clean-on-empty-db test. |
 | `enrich` | **Recorded fixtures, not mocks.** Real Sonnet 5 responses captured once and replayed offline. One fixture per failure mode: 401, 429, malformed JSON, and schema-valid-but-wrong-enum. |
 | `config` | Each missing prerequisite produces a distinct, named startup error. |
+| `telegram` registry | Every entry passes Telegram's name and description constraints. Router dispatches each registered name and falls back to help on an unknown one. `/help` output covers exactly the registry — no missing entries, no extras. Sync issues `setMyCommands` when the remote list differs and skips the call when it matches. |
 | `transcribe` | One committed 3-second OGG through the real binary; skipped with an explicit message when whisper is absent. |
 | End-to-end | One Playwright spec: type an idea → row appears immediately → metadata fills in via SSE → search finds it → archive → restore. |
 
@@ -403,11 +440,12 @@ No secrets are committed. `.gitignore` covers `node_modules/`, `dist/`, `.playwr
 2. An idea typed in the web app appears on screen in under 50ms and is enriched within roughly 5 seconds without a refresh.
 3. The same holds from Telegram, by text and by voice.
 4. `/s <query>` in Telegram returns tappable results — no IDs, no copy-paste.
-5. List, search, filter (difficulty, duration, treatment, stage, archived), sort, notes, links, merge, archive, restore, and delete all work from the web app.
-6. Every inferred field is correctable, and correcting a field protects it from re-enrichment.
-7. A dead or unkeyed API key surfaces as a visible error on the row with a working Retry — never as a silent stall.
-8. `make test` passes, including the Playwright spec.
-9. `PROJECT_LOG.md` records project state, and the branch is merged to `main`.
+5. The Telegram command menu is populated by the running app. Starting against a bot whose only BotFather configuration is its token produces a correct menu, and `/help` matches it exactly.
+6. List, search, filter (difficulty, duration, treatment, stage, archived), sort, notes, links, merge, archive, restore, and delete all work from the web app.
+7. Every inferred field is correctable, and correcting a field protects it from re-enrichment.
+8. A dead or unkeyed API key surfaces as a visible error on the row with a working Retry — never as a silent stall.
+9. `make test` passes, including the Playwright spec.
+10. `PROJECT_LOG.md` records project state, and the branch is merged to `main`.
 
 Work stops at that point for approval before Milestone 2.
 
