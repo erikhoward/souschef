@@ -315,3 +315,16 @@ kbd { padding: 2px 5px; border: 1px solid rgb(255 255 255 / .36); border-radius:
 }
 
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; } }
+
+.connection-warning {
+  position: fixed;
+  z-index: 11;
+  bottom: 22px;
+  left: 24px;
+  padding: 9px 13px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+}
