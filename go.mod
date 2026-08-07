@@ -5,6 +5,7 @@ go 1.26.5
 require (
 	github.com/anthropics/anthropic-sdk-go v1.61.0
 	github.com/google/uuid v1.6.0
+	github.com/joho/godotenv v1.5.1
 	modernc.org/sqlite v1.56.0
 )
 
