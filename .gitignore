@@ -9,3 +9,6 @@ dist/
 /data/
 /models/
 /bin/
+/web/test-results/
+/web/playwright-report/
+/web/blob-report/

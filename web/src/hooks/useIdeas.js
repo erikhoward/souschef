@@ -95,8 +95,22 @@ export function useIdeas(filters) {
   }, []);
 
   const patch    = useCallback(async (id, p)     => replace(await api.patchIdea(id, p)), [replace]);
-  const archive  = useCallback(async (id)        => replace(await api.archiveIdea(id)), [replace]);
-  const restore  = useCallback(async (id)        => replace(await api.restoreIdea(id)), [replace]);
+  // Archiving/restoring can change whether the idea belongs in the
+  // *currently filtered* view (the default view excludes archived ideas,
+  // the Archived tab excludes everything else). A plain replace() would
+  // leave a stale entry visible until some unrelated event happened to
+  // trigger a refetch, so these two re-derive the filtered list from the
+  // server instead of patching in place.
+  const archive  = useCallback(async (id) => {
+    const updated = await api.archiveIdea(id);
+    await refresh();
+    return updated;
+  }, [refresh]);
+  const restore  = useCallback(async (id) => {
+    const updated = await api.restoreIdea(id);
+    await refresh();
+    return updated;
+  }, [refresh]);
   const reenrich = useCallback(async (id)        => replace(await api.reenrichIdea(id)), [replace]);
   const link     = useCallback(async (id, other) => replace(await api.linkIdeas(id, other)), [replace]);
   const addNote  = useCallback(async (id, body)  => replace(await api.addNote(id, body)), [replace]);

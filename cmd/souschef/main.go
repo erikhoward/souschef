@@ -16,6 +16,8 @@ import (
 	"github.com/erikhoward/souschef/internal/httpapi"
 	"github.com/erikhoward/souschef/internal/ideas"
 	"github.com/erikhoward/souschef/internal/store"
+	"github.com/erikhoward/souschef/internal/telegram"
+	"github.com/erikhoward/souschef/internal/transcribe"
 )
 
 // version is overridden at build time via -ldflags.
@@ -48,9 +50,12 @@ func run() error {
 	hub := httpapi.NewHub()
 	defer hub.Close()
 
+	ideaService := ideas.NewService(st)
+	enricher := enrich.New(cfg.Model, cfg.Effort)
+
 	api := httpapi.New(httpapi.Deps{
-		Ideas:    ideas.NewService(st),
-		Enricher: enrich.New(cfg.Model, cfg.Effort),
+		Ideas:    ideaService,
+		Enricher: enricher,
 		Hub:      hub,
 	})
 
@@ -80,6 +85,26 @@ func run() error {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("http server: %v", err)
 			stop()
+		}
+	}()
+
+	telegramClient := telegram.NewClient(cfg.TelegramToken)
+	bot, err := telegram.New(telegram.Deps{
+		Client:      telegramClient,
+		Ideas:       ideaService,
+		Enricher:    enricher,
+		Transcriber: transcribe.New(cfg.WhisperBin, cfg.WhisperModel),
+		ChatID:      cfg.TelegramChatID,
+		AudioDir:    cfg.AudioDir,
+		WebBaseURL:  fmt.Sprintf("http://127.0.0.1:%d", cfg.Port),
+	})
+	if err != nil {
+		return fmt.Errorf("telegram: %w", err)
+	}
+
+	go func() {
+		if err := bot.Run(ctx); err != nil {
+			log.Printf("telegram: %v", err)
 		}
 	}()
 

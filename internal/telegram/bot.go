@@ -197,6 +197,16 @@ func (b *Bot) enrichAndEdit(ideaID, rawText string, messageID int64) {
 	}
 	if err != nil {
 		log.Printf("telegram: record enrichment for %s: %v", ideaID, err)
+		// The idea itself is already saved safely — only its enrichment
+		// status write failed — but the message is stuck at "Reading it
+		// now…" with no way for the user to know something went wrong.
+		// Leaving it there forever is exactly the silent-hang failure mode
+		// this project has already been burned by once; edit the message
+		// with a legible error instead of returning quietly.
+		if editErr := b.Client.EditMessageText(ctx, b.ChatID, messageID,
+			"⚠️ Could not read it: "+escapeHTML(err.Error()), nil); editErr != nil {
+			log.Printf("telegram: edit message %d after enrichment error: %v", messageID, editErr)
+		}
 		return
 	}
 

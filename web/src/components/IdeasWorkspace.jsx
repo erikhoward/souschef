@@ -529,26 +529,33 @@ export function IdeasWorkspace({
               <span>Content type</span><span>Status</span><span>Next action</span>
             </div>
 
-            {error && <div className="empty-list" role="alert">{error}</div>}
-            {loading && !ideas.length && <div className="empty-list">Loading…</div>}
+            {/* A dedicated wrapper keeps the heading row out of the sibling
+                chain: .idea-row must be the true :first-child / :last-of-type
+                among the rows themselves (Playwright's e2e suite depends on
+                that), not merely the first row-shaped element under a parent
+                that also holds the heading, loading, and empty states. */}
+            <div className="idea-rows">
+              {error && <div className="empty-list" role="alert">{error}</div>}
+              {loading && !ideas.length && <div className="empty-list">Loading…</div>}
 
-            {ideas.map((idea) => (
-              <IdeaRow
-                key={idea.id}
-                idea={idea}
-                isSelected={idea.id === selectedId}
-                onSelect={onSelect}
-                onRetry={retry}
-                now={now}
-              />
-            ))}
+              {ideas.map((idea) => (
+                <IdeaRow
+                  key={idea.id}
+                  idea={idea}
+                  isSelected={idea.id === selectedId}
+                  onSelect={onSelect}
+                  onRetry={retry}
+                  now={now}
+                />
+              ))}
 
-            {!loading && !ideas.length && !error && (
-              <div className="empty-list">
-                <Icon name="search" size={28} />
-                {active.q ? 'No ideas match that search.' : 'Nothing captured yet.'}
-              </div>
-            )}
+              {!loading && !ideas.length && !error && (
+                <div className="empty-list">
+                  <Icon name="search" size={28} />
+                  {active.q ? 'No ideas match that search.' : 'Nothing captured yet.'}
+                </div>
+              )}
+            </div>
             <footer>{ideas.length} idea{ideas.length === 1 ? '' : 's'}</footer>
           </section>
         </section>
