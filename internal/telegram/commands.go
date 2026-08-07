@@ -145,7 +145,7 @@ func menusEqual(a, b []BotCommand) bool {
 // SyncCommands publishes the menu only when it differs from what Telegram
 // already has, turning a real change into one log line and a no-op restart
 // into nothing at all.
-func SyncCommands(ctx context.Context, client *Client, chatID int64, registry []Command) (bool, error) {
+func SyncCommands(ctx context.Context, client API, chatID int64, registry []Command) (bool, error) {
 	if err := ValidateRegistry(registry); err != nil {
 		return false, err
 	}

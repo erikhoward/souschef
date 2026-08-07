@@ -38,11 +38,11 @@ func TestEveryCommandHasAHandler(t *testing.T) {
 
 func TestValidateRegistryRejectsBadEntries(t *testing.T) {
 	cases := map[string][]Command{
-		"uppercase name":   {{Name: "Search", Desc: "Search ideas", Handler: noopHandler}},
-		"name with space":  {{Name: "find idea", Desc: "Search ideas", Handler: noopHandler}},
-		"empty name":       {{Name: "", Desc: "Search ideas", Handler: noopHandler}},
-		"short desc":       {{Name: "s", Desc: "hi", Handler: noopHandler}},
-		"missing handler":  {{Name: "s", Desc: "Search ideas"}},
+		"uppercase name":  {{Name: "Search", Desc: "Search ideas", Handler: noopHandler}},
+		"name with space": {{Name: "find idea", Desc: "Search ideas", Handler: noopHandler}},
+		"empty name":      {{Name: "", Desc: "Search ideas", Handler: noopHandler}},
+		"short desc":      {{Name: "s", Desc: "hi", Handler: noopHandler}},
+		"missing handler": {{Name: "s", Desc: "Search ideas"}},
 		"duplicate name": {
 			{Name: "s", Desc: "Search ideas", Handler: noopHandler},
 			{Name: "s", Desc: "Search again", Handler: noopHandler},

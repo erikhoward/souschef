@@ -24,8 +24,31 @@ type Transcriber interface {
 	Transcribe(ctx context.Context, audioPath string) (string, error)
 }
 
+// API is the slice of the Telegram Bot API this package needs.
+//
+// It exists so the bot can be tested. Until this was extracted, Deps.Client
+// was the concrete *Client — hardcoded to api.telegram.org — which made
+// handleSearch, handleRecent, handleCallback and the capture flow impossible
+// to exercise without a live token, and left them the largest untested
+// surface in the codebase.
+//
+// Declare only what is used: *Client has more methods than this, and the ones
+// it does not need do not belong here.
+type API interface {
+	GetUpdates(ctx context.Context, offset int64, timeoutSeconds int) ([]Update, error)
+	SendMessage(ctx context.Context, chatID int64, text string, markup *InlineKeyboardMarkup) (Message, error)
+	EditMessageText(ctx context.Context, chatID, messageID int64, text string, markup *InlineKeyboardMarkup) error
+	AnswerCallbackQuery(ctx context.Context, id, text string) error
+	GetMyCommands(ctx context.Context, chatID int64) ([]BotCommand, error)
+	SetMyCommands(ctx context.Context, chatID int64, commands []BotCommand) error
+	DownloadFile(ctx context.Context, fileID, dir string) (string, error)
+}
+
+// Compile-time proof the real client still satisfies the interface.
+var _ API = (*Client)(nil)
+
 type Deps struct {
-	Client      *Client
+	Client      API
 	Ideas       *ideas.Service
 	Enricher    Enricher
 	Transcriber Transcriber
