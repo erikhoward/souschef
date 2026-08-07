@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.playwright-mcp/
+.superpowers/
+.env
+*.db
+*.db-shm
+*.db-wal
+/data/
+/models/
+/bin/
+/web/test-results/
+/web/playwright-report/
+/web/blob-report/

@@ -1,0 +1,14 @@
+{
+  "title": "Crispy chili eggs with scallion oil",
+  "difficulty": "easy",
+  "duration_class": "quick",
+  "treatment": "elevated",
+  "content_type": "recipe",
+  "cuisine": "Chinese-inspired",
+  "primary_ingredient": "Eggs",
+  "equipment": ["wok", "slotted spoon"],
+  "visual_potential": "high",
+  "seasonality": "all_year",
+  "production_effort": "light",
+  "tags": ["weeknight", "fast", "crispy"]
+}

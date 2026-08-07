@@ -1,0 +1,21 @@
+{
+  "name": "sous-chef",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "react-router": "^8.3.0",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1"
+  }
+}

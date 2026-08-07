@@ -1,0 +1,14 @@
+{
+  "title": "Wrong enum",
+  "difficulty": "trivial",
+  "duration_class": "quick",
+  "treatment": "elevated",
+  "content_type": "recipe",
+  "cuisine": "Italian",
+  "primary_ingredient": "Pasta",
+  "equipment": [],
+  "visual_potential": "high",
+  "seasonality": "all_year",
+  "production_effort": "light",
+  "tags": []
+}
