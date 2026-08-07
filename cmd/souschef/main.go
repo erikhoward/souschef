@@ -73,8 +73,14 @@ func run() error {
 	defer st.Close()
 
 	srv := &http.Server{
-		Addr:              fmt.Sprintf("127.0.0.1:%d", cfg.Port),
-		Handler:           httpapi.WithStatic(api),
+		Addr: fmt.Sprintf("127.0.0.1:%d", cfg.Port),
+		// LocalOnly wraps the whole handler, static assets included, rather
+		// than living inside httpapi.New: New returns *Server because run()
+		// needs its Drain method, and WithStatic's signature has no port to
+		// thread through. Composing it here keeps the port coming from config
+		// and puts the Host check in front of everything, so DNS rebinding
+		// cannot reach the SPA shell either.
+		Handler:           httpapi.LocalOnly(httpapi.WithStatic(api), cfg.Port),
 		ReadHeaderTimeout: 10 * time.Second,
 		// No WriteTimeout: it would sever the SSE stream on a fixed interval.
 	}
