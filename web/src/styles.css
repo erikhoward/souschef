@@ -75,10 +75,13 @@ kbd { padding: 2px 5px; border: 1px solid rgb(255 255 255 / .36); border-radius:
 .idea-list { min-width: 0; }
 .idea-list-heading, .idea-row { display: grid; grid-template-columns: minmax(175px, 1.45fr) 92px minmax(145px, .98fr) minmax(105px, .75fr) minmax(100px, .76fr) minmax(105px, .8fr); column-gap: 9px; align-items: center; }
 .idea-list-heading { min-height: 57px; padding: 0 18px; color: var(--muted); font-size: 11px; }
-.idea-row { position: relative; width: 100%; min-height: 113px; padding: 12px 18px; border: 0; border-top: 1px solid var(--border); background: transparent; color: var(--text); text-align: left; }
+.idea-row { position: relative; width: 100%; min-height: 113px; padding: 12px 18px; border: 0; border-top: 1px solid var(--border); background: transparent; color: var(--text); text-align: left; cursor: pointer; }
 .idea-row:last-of-type { border-bottom: 1px solid var(--border); }
 .idea-row:hover { background: var(--surface-alt); }
+.idea-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .idea-row.is-selected { background: var(--surface); box-shadow: inset 3px 0 var(--accent); }
+/* Failed enrichment must be visible scanning a long list, not just on open. */
+.idea-row.is-failed { background: color-mix(in srgb, var(--danger) 4%, transparent); }
 .row-title-group { min-width: 0; display: flex; align-items: center; gap: 12px; }
 .row-title-group strong {
   display: block;
@@ -111,10 +114,19 @@ kbd { padding: 2px 5px; border: 1px solid rgb(255 255 255 / .36); border-radius:
   line-height: 1;
   user-select: none;
 }
-.row-meta { display: grid; gap: 2px; align-content: center; }
+.row-meta { min-width: 0; display: grid; gap: 2px; align-content: center; }
 .meta-value { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 11px; line-height: 1.2; text-transform: capitalize; }
 .meta-value .icon { color: var(--muted); }
 .meta-value.easy .icon { color: var(--status-ready); }
+
+.meta-pending { min-width: 0; display: flex; align-items: center; gap: 8px; color: var(--faint); font-size: 11px; font-style: italic; }
+.meta-pending.is-stale { color: var(--warn); font-style: normal; }
+.meta-pending .text-button { flex: 0 0 auto; font-style: normal; }
+
+.meta-failed { min-width: 0; display: flex; align-items: center; gap: 6px; color: var(--danger); font-size: 11px; }
+.meta-failed .icon { flex: 0 0 auto; }
+.meta-failed-text { display: block; min-width: 0; flex: 1 1 auto; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.meta-failed .text-button { flex: 0 0 auto; }
 .content-type { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; line-height: 1.3; }
 .status-cell { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
 .status-cell small { width: 100%; margin-left: 16px; color: var(--faint); font-size: 10px; }
@@ -153,6 +165,27 @@ kbd { padding: 2px 5px; border: 1px solid rgb(255 255 255 / .36); border-radius:
 .metadata-list div { display: grid; grid-template-columns: 1fr 1.05fr; align-items: center; gap: 7px; }
 .metadata-list dt, .metadata-list dd { min-width: 0; margin: 0; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
 .metadata-list dd { color: var(--text); }
+.metadata-list select,
+.metadata-list input[type='text'] {
+  width: 100%; height: 28px; padding: 0 7px;
+  border: 1px solid var(--border); border-radius: 3px;
+  background: var(--surface); color: var(--text); font-size: 11px;
+}
+.override-mark { margin-left: 5px; color: var(--accent); font-size: 11px; }
+
+.inspector-alert, .inspector-pending {
+  margin: 16px 0; padding: 13px;
+  border: 1px solid var(--danger); border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--danger) 6%, var(--surface));
+}
+.inspector-alert strong { display: block; color: var(--danger); font-size: 12px; }
+.inspector-alert p { margin: 6px 0 11px; color: var(--muted); font-size: 11px; line-height: 1.4; word-break: break-word; }
+/* Pending reuses the alert layout but in a quieter tone: a stranded idea
+ * needs the same Retry affordance, but a normally-pending one (which
+ * resolves in a few seconds) should not look like something is wrong. */
+.inspector-pending { border-color: var(--border-strong); background: var(--surface-alt); }
+.inspector-pending strong { display: block; color: var(--text); font-size: 12px; }
+.inspector-pending p { margin: 6px 0 11px; color: var(--muted); font-size: 11px; line-height: 1.4; }
 .notes-input { width: 100%; min-height: 66px; margin-top: 12px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); resize: vertical; color: var(--muted); background: var(--surface); font-size: 11px; line-height: 1.4; }
 .related-list { margin-top: 12px; display: grid; gap: 9px; }
 .related-list button { padding: 0; border: 0; display: flex; align-items: center; gap: 10px; color: var(--text); background: transparent; text-align: left; font-size: 11px; }

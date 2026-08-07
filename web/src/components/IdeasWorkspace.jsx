@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { thumbnailProps } from '../lib/thumbnail.js';
 import { Icon } from './Icon.jsx';
@@ -31,6 +31,15 @@ const labelize = (value) => (value ? value.replaceAll('_', ' ') : '—');
 
 const DURATION_LABELS = { quick: '20 min', average: '45 min', multi_day: 'Multi-day' };
 
+// A pending idea normally resolves within a few seconds. Past this, the
+// enrichment worker may have died mid-run (process killed, or shutdown
+// drained past its grace period) with no automatic re-drive on restart.
+// Once an idea has been pending longer than this, the row grows a Retry
+// affordance instead of leaving it stuck with none. The inspector offers
+// Retry for a pending idea immediately, since opening it is already a
+// deliberate action.
+const PENDING_STALE_MS = 45_000;
+
 function FoodThumbnail({ idea }) {
   const { letter, style, label } = thumbnailProps(idea);
   return (
@@ -58,21 +67,73 @@ function PipelineStepper({ stage }) {
   );
 }
 
-function IdeaRow({ idea, isSelected, onSelect, onRetry }) {
+// The row is a div[role=button], not a <button>. The Retry control it can
+// contain is itself an interactive control, and nesting a <button> inside a
+// <button> is invalid HTML that leaves the inner control unreachable by
+// keyboard in some browsers. A div with an explicit role and key handling
+// gives the same activation behaviour without that trap.
+function IdeaRow({ idea, isSelected, onSelect, onRetry, now }) {
   const { metadata, enrichment } = idea;
+  const isStalePending = enrichment.status === 'pending'
+    && now - new Date(idea.created_at).getTime() > PENDING_STALE_MS;
+
   return (
-    <button className={`idea-row ${isSelected ? 'is-selected' : ''}`} type="button" onClick={() => onSelect(idea.id)}>
+    <div
+      className={`idea-row ${isSelected ? 'is-selected' : ''} ${enrichment.status === 'failed' ? 'is-failed' : ''}`}
+      role="button"
+      tabIndex={0}
+      onClick={() => onSelect(idea.id)}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onSelect(idea.id);
+        }
+      }}
+    >
       <span className="row-title-group">
         <span className="selection-mark"><Icon name={isSelected ? 'check' : 'lightbulb'} size={15} /></span>
         <span><strong>{idea.title}</strong><small>{idea.raw_text}</small></span>
       </span>
       <FoodThumbnail idea={idea} />
       <span className="row-meta">
-        <MetaIcon icon="lightbulb" tone={metadata.difficulty}>{labelize(metadata.difficulty)}</MetaIcon>
-        <MetaIcon icon="clock">{DURATION_LABELS[metadata.duration_class] ?? labelize(metadata.duration_class)}</MetaIcon>
-        <MetaIcon icon="leaf">{labelize(metadata.treatment)}</MetaIcon>
-        <MetaIcon icon="globe">{metadata.cuisine || '—'}</MetaIcon>
-        <MetaIcon icon="egg">{metadata.primary_ingredient || '—'}</MetaIcon>
+        {enrichment.status === 'pending' && (
+          <span className={`meta-pending ${isStalePending ? 'is-stale' : ''}`}>
+            Reading…
+            {isStalePending && (
+              <button
+                type="button"
+                className="text-button"
+                onClick={(event) => { event.stopPropagation(); onRetry(idea.id); }}
+              >
+                Retry
+              </button>
+            )}
+          </span>
+        )}
+
+        {enrichment.status === 'failed' && (
+          <span className="meta-failed">
+            <Icon name="x" size={13} />
+            <span className="meta-failed-text" title={enrichment.error}>{enrichment.error}</span>
+            <button
+              type="button"
+              className="text-button"
+              onClick={(event) => { event.stopPropagation(); onRetry(idea.id); }}
+            >
+              Retry
+            </button>
+          </span>
+        )}
+
+        {enrichment.status === 'ok' && (
+          <>
+            <MetaIcon icon="lightbulb" tone={metadata.difficulty}>{labelize(metadata.difficulty)}</MetaIcon>
+            <MetaIcon icon="clock">{DURATION_LABELS[metadata.duration_class] ?? labelize(metadata.duration_class)}</MetaIcon>
+            <MetaIcon icon="leaf">{labelize(metadata.treatment)}</MetaIcon>
+            <MetaIcon icon="globe">{metadata.cuisine || '—'}</MetaIcon>
+            <MetaIcon icon="egg">{metadata.primary_ingredient || '—'}</MetaIcon>
+          </>
+        )}
       </span>
       <span className="content-type">
         <Icon name={metadata.content_type === 'vlog' ? 'video' : 'book'} size={19} />
@@ -83,21 +144,10 @@ function IdeaRow({ idea, isSelected, onSelect, onRetry }) {
         {idea.archived_at ? 'Archived' : STATUS_LABELS[idea.stage]}
         <small>{new Date(idea.updated_at).toLocaleString()}</small>
       </span>
-      {enrichment.status === 'failed' ? (
-        <span
-          className="row-action"
-          onClick={(event) => { event.stopPropagation(); onRetry(idea.id); }}
-        >
-          Retry enrichment<Icon name="arrow" size={18} />
-        </span>
-      ) : enrichment.status === 'pending' ? (
-        <span className="row-action">Enriching…</span>
-      ) : (
-        <span className="row-action" onClick={(event) => { event.stopPropagation(); onSelect(idea.id); }}>
-          View idea<Icon name="arrow" size={18} />
-        </span>
-      )}
-    </button>
+      <span className="row-action">
+        Open<Icon name="arrow" size={18} />
+      </span>
+    </div>
   );
 }
 
@@ -199,11 +249,99 @@ function LinkControl({ candidates, onLink }) {
   );
 }
 
+// Enumerated fields render as a <select> of the exact values the backend
+// accepts; everything else is free text. `equipment` and `tags` are arrays
+// on the wire, so they get a comma-separated text representation that is
+// parsed back into a list on blur.
+const FIELD_OPTIONS = {
+  difficulty: ['easy', 'moderate', 'insane'],
+  duration_class: ['quick', 'average', 'multi_day'],
+  treatment: ['elevated', 'non_elevated'],
+  content_type: ['recipe', 'vlog'],
+  visual_potential: ['low', 'medium', 'high'],
+  seasonality: ['spring', 'summer', 'fall', 'winter', 'all_year'],
+  production_effort: ['light', 'average', 'heavy'],
+};
+
+const ARRAY_FIELDS = ['equipment', 'tags'];
+
+const FIELD_LABELS = {
+  title: 'Title',
+  difficulty: 'Difficulty',
+  duration_class: 'Duration',
+  treatment: 'Treatment',
+  content_type: 'Content type',
+  cuisine: 'Cuisine',
+  primary_ingredient: 'Primary ingredient',
+  visual_potential: 'Visual potential',
+  seasonality: 'Seasonality',
+  production_effort: 'Production effort',
+  equipment: 'Equipment',
+  tags: 'Tags',
+};
+
+const arraysEqual = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+
+// A corrected field is marked so it is obvious which values are yours and
+// which the model's — and so the protection from re-enrichment is visible
+// rather than an invisible rule.
+function CorrectableField({ idea, field, onCorrect }) {
+  const options = FIELD_OPTIONS[field];
+  const isArray = ARRAY_FIELDS.includes(field);
+  const overridden = idea.field_overrides.includes(field);
+  const arrayValue = isArray ? (idea.metadata[field] ?? []) : null;
+  // `title` is the one correctable field that lives on the idea itself, not
+  // under `metadata` — the backend maps it to `Idea.Title`, and
+  // `metadata.title` is an unrelated, always-empty field on the wire.
+  const value = field === 'title'
+    ? idea.title
+    : isArray ? arrayValue.join(', ') : (idea.metadata[field] ?? '');
+
+  return (
+    <div>
+      <dt>
+        {FIELD_LABELS[field]}
+        {overridden && <span className="override-mark" title="You set this. Re-enrichment will not change it.">✎</span>}
+      </dt>
+      <dd>
+        {options ? (
+          <select value={value} onChange={(event) => onCorrect(field, event.target.value)}
+                  aria-label={FIELD_LABELS[field]}>
+            <option value="">—</option>
+            {options.map((option) => (
+              <option key={option} value={option}>{labelize(option)}</option>
+            ))}
+          </select>
+        ) : (
+          <input
+            type="text"
+            defaultValue={value}
+            aria-label={FIELD_LABELS[field]}
+            placeholder={isArray ? 'Comma-separated' : undefined}
+            onBlur={(event) => {
+              if (isArray) {
+                const parsed = event.target.value.split(',').map((v) => v.trim()).filter(Boolean);
+                if (!arraysEqual(parsed, arrayValue)) onCorrect(field, parsed);
+              } else if (event.target.value !== value) {
+                onCorrect(field, event.target.value);
+              }
+            }}
+          />
+        )}
+      </dd>
+    </div>
+  );
+}
+
 function IdeaInspector({ idea, allIdeas, store, guard, announce, onSelect, onClose }) {
   const [notesDraft, setNotesDraft] = useState('');
+  const [mergeTarget, setMergeTarget] = useState('');
   const isArchived = Boolean(idea.archived_at);
   const linkCandidates = allIdeas.filter((candidate) => candidate.id !== idea.id && !idea.linked_ids.includes(candidate.id) && !candidate.archived_at);
-  const { metadata, enrichment } = idea;
+  // Merging is a corrective action for duplicates, so it deliberately does
+  // not exclude archived ideas or ideas already linked the way linking does.
+  const mergeCandidates = allIdeas.filter((candidate) => candidate.id !== idea.id);
+  const { enrichment } = idea;
 
   const handleAddNote = async (event) => {
     event.preventDefault();
@@ -213,6 +351,17 @@ function IdeaInspector({ idea, allIdeas, store, guard, announce, onSelect, onClo
     if (result) setNotesDraft('');
   };
 
+  const correct = guard(
+    (field, value) => store.patch(idea.id, { [field]: value }),
+    'Saved. Re-enrichment will leave that field alone.'
+  );
+
+  const handleMerge = async () => {
+    if (!mergeTarget) return;
+    const result = await guard(store.merge, 'Merged.')(idea.id, mergeTarget);
+    if (result) setMergeTarget('');
+  };
+
   return (
     <aside className="inspector" aria-label={`${idea.title} details`}>
       <button className="icon-button inspector-close" type="button" onClick={onClose} aria-label="Close details"><Icon name="x" size={20} /></button>
@@ -220,27 +369,32 @@ function IdeaInspector({ idea, allIdeas, store, guard, announce, onSelect, onClo
       <PipelineStepper stage={idea.stage} />
 
       {enrichment.status === 'pending' && (
-        <p className="muted-copy">Enrichment is running — metadata will fill in shortly.</p>
+        <div className="inspector-pending" role="status">
+          <strong>Reading this idea…</strong>
+          <p>Metadata will fill in shortly. If this sticks around, retry it.</p>
+          <button className="button button-outline" type="button"
+                  onClick={guard(() => store.reenrich(idea.id), 'Retrying…')}>
+            Retry enrichment
+          </button>
+        </div>
       )}
       {enrichment.status === 'failed' && (
-        <div className="empty-list" role="alert">
-          {enrichment.error || 'Enrichment failed.'}
-          <button className="text-button" type="button" onClick={guard(() => store.reenrich(idea.id), 'Retrying enrichment…')}>
+        <div className="inspector-alert" role="alert">
+          <strong>Enrichment failed</strong>
+          <p>{enrichment.error || 'Enrichment failed.'}</p>
+          <button className="button button-outline" type="button"
+                  onClick={guard(() => store.reenrich(idea.id), 'Retrying…')}>
             Retry enrichment
           </button>
         </div>
       )}
 
       <section className="inspector-section metadata-section">
-        <div className="section-title"><h3>Inferred metadata</h3></div>
+        <div className="section-title"><h3>Metadata</h3></div>
         <dl className="metadata-list">
-          <div><dt><Icon name="lightbulb" size={16} />Difficulty</dt><dd><i className={`status-dot ${metadata.difficulty}`} />{labelize(metadata.difficulty)}</dd></div>
-          <div><dt><Icon name="clock" size={16} />Duration</dt><dd><Icon name="clock" size={15} />{DURATION_LABELS[metadata.duration_class] ?? labelize(metadata.duration_class)}</dd></div>
-          <div><dt><Icon name="leaf" size={16} />Treatment</dt><dd><Icon name="leaf" size={15} />{labelize(metadata.treatment)}</dd></div>
-          <div><dt><Icon name="globe" size={16} />Cuisine</dt><dd><Icon name="globe" size={15} />{metadata.cuisine || '—'}</dd></div>
-          <div><dt><Icon name="egg" size={16} />Primary ingredient</dt><dd><Icon name="egg" size={15} />{metadata.primary_ingredient || '—'}</dd></div>
-          <div><dt><Icon name="video" size={16} />Content type</dt><dd><Icon name="video" size={15} />{metadata.content_type === 'vlog' ? 'Vlog' : 'Video + Recipe'}</dd></div>
-          <div><dt><Icon name="sparkles" size={16} />Visual potential</dt><dd><i className="status-dot easy" />{labelize(metadata.visual_potential)}</dd></div>
+          {Object.keys(FIELD_LABELS).map((field) => (
+            <CorrectableField key={field} idea={idea} field={field} onCorrect={correct} />
+          ))}
         </dl>
       </section>
 
@@ -280,6 +434,21 @@ function IdeaInspector({ idea, allIdeas, store, guard, announce, onSelect, onClo
       </section>
 
       <div className="inspector-actions">
+        {mergeCandidates.length > 0 && (
+          <div className="link-control">
+            <select value={mergeTarget} onChange={(event) => setMergeTarget(event.target.value)}
+                    aria-label="Merge a duplicate into this idea">
+              <option value="">Merge a duplicate in…</option>
+              {mergeCandidates.map((candidate) => (
+                <option key={candidate.id} value={candidate.id}>{candidate.title}</option>
+              ))}
+            </select>
+            <button className="text-button" type="button" disabled={!mergeTarget} onClick={handleMerge}>
+              Merge
+            </button>
+          </div>
+        )}
+
         <div className="secondary-actions">
           <button
             type="button"
@@ -311,6 +480,18 @@ export function IdeasWorkspace({
 }) {
   const { ideas, loading, error } = store;
   const selectedIdea = ideas.find((idea) => idea.id === selectedId) ?? null;
+  const retry = guard(store.reenrich, 'Retrying enrichment…');
+
+  // Ticks only while an idea is pending, so a row can notice it has gone
+  // stale and grow a Retry affordance without polling forever.
+  const [now, setNow] = useState(() => Date.now());
+  const hasPending = ideas.some((idea) => idea.enrichment.status === 'pending');
+  useEffect(() => {
+    if (!hasPending) return undefined;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 15_000);
+    return () => window.clearInterval(timer);
+  }, [hasPending]);
 
   return (
     <main className="workspace ideas-workspace">
@@ -357,7 +538,8 @@ export function IdeasWorkspace({
                 idea={idea}
                 isSelected={idea.id === selectedId}
                 onSelect={onSelect}
-                onRetry={guard(store.reenrich, 'Retrying enrichment…')}
+                onRetry={retry}
+                now={now}
               />
             ))}
 
