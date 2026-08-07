@@ -4902,7 +4902,7 @@ Create `web/src/styles/tokens.css`:
   --surface: #fcfaf5;
   --surface-alt: #f4efe6;
   --border: #dbd4c6;
-  --border-strong: #c6bda c;
+  --border-strong: #c6bdac;
 
   --text: #24221d;
   --muted: #736c62;
@@ -4933,11 +4933,6 @@ Create `web/src/styles/tokens.css`:
   --radius-sm: 4px;
 }
 ```
-
-Note: `--border-strong` above contains a deliberate typo (`#c6bda c`) — fix it
-to `#c6bdac` when you paste it. If your editor does not flag it, the browser
-will silently ignore the declaration, which is exactly the kind of thing to
-catch now rather than wonder about later.
 
 - [ ] **Step 3: Apply the tokens across styles.css**
 
@@ -6158,12 +6153,1831 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
-## Remaining tasks
+## Task 14: whisper.cpp transcription
 
-Tasks 14–17 follow the same structure. Deliverables:
+**Files:**
+- Create: `internal/transcribe/whisper.go`, `internal/transcribe/whisper_test.go`, `internal/transcribe/testdata/sample.ogg`
+- Modify: `README.md`
 
-| Task | Deliverable |
-|---|---|
+**Interfaces:**
+- Consumes: `config.Config.WhisperBin`, `.WhisperModel`, `.AudioDir`.
+- Produces: `transcribe.New(bin, model string) *Transcriber`; `(*Transcriber).Transcribe(ctx, audioPath string) (string, error)`; `transcribe.ErrEmptyTranscript`.
+
+- [ ] **Step 1: Record a short sample**
+
+```bash
+mkdir -p internal/transcribe/testdata
+# macOS: record ~3 seconds saying "sheet pan shawarma with lemony feta"
+ffmpeg -f avfoundation -i ":default" -t 3 -c:a libopus -b:a 24k \
+  internal/transcribe/testdata/sample.ogg
+ls -la internal/transcribe/testdata/
+```
+
+If `ffmpeg` is unavailable, any short spoken `.ogg` works. Keep it under 100KB.
+
+- [ ] **Step 2: Write the failing test**
+
+Create `internal/transcribe/whisper_test.go`:
+
+```go
+package transcribe
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// binAndModel resolves the local whisper install, skipping the test when it
+// is absent. whisper.cpp is a documented prerequisite, not a vendored
+// dependency, so CI and a fresh checkout must not fail on its absence — but
+// the skip message has to say exactly what to install.
+func binAndModel(t *testing.T) (string, string) {
+	t.Helper()
+
+	bin := os.Getenv("WHISPER_BIN")
+	if bin == "" {
+		bin = "/opt/homebrew/bin/whisper-cli"
+	}
+	model := os.Getenv("WHISPER_MODEL")
+	if model == "" {
+		model = "./models/ggml-base.en.bin"
+	}
+
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("whisper binary not found at %s — install with `brew install whisper-cpp`", bin)
+	}
+	if _, err := os.Stat(model); err != nil {
+		t.Skipf("whisper model not found at %s — download a ggml model from "+
+			"https://huggingface.co/ggerganov/whisper.cpp", model)
+	}
+	return bin, model
+}
+
+func TestTranscribeProducesText(t *testing.T) {
+	bin, model := binAndModel(t)
+	tr := New(bin, model)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	got, err := tr.Transcribe(ctx, filepath.Join("testdata", "sample.ogg"))
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	if strings.TrimSpace(got) == "" {
+		t.Fatal("transcript is empty")
+	}
+	t.Logf("transcript: %q", got)
+}
+
+func TestTranscribeMissingFileIsAnError(t *testing.T) {
+	bin, model := binAndModel(t)
+	tr := New(bin, model)
+
+	_, err := tr.Transcribe(context.Background(), "testdata/does-not-exist.ogg")
+	if err == nil {
+		t.Fatal("expected an error for a missing audio file")
+	}
+}
+
+// The subprocess must not be able to hang the capture path indefinitely.
+func TestTranscribeRespectsContextCancellation(t *testing.T) {
+	bin, model := binAndModel(t)
+	tr := New(bin, model)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	if _, err := tr.Transcribe(ctx, filepath.Join("testdata", "sample.ogg")); err == nil {
+		t.Fatal("expected an error when the context is already cancelled")
+	}
+}
+
+// stripTimestamps is pure, so it is tested without the binary present.
+func TestStripTimestamps(t *testing.T) {
+	raw := "[00:00:00.000 --> 00:00:03.400]   sheet pan shawarma\n" +
+		"[00:00:03.400 --> 00:00:05.100]   with lemony feta\n"
+
+	got := stripTimestamps(raw)
+	want := "sheet pan shawarma with lemony feta"
+	if got != want {
+		t.Errorf("stripTimestamps:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestStripTimestampsHandlesPlainOutput(t *testing.T) {
+	if got := stripTimestamps("just plain text\n"); got != "just plain text" {
+		t.Errorf("got %q", got)
+	}
+}
+```
+
+- [ ] **Step 3: Run it to make sure it fails**
+
+Run: `go test ./internal/transcribe/ -v`
+Expected: FAIL — `undefined: New` (or SKIP messages plus the `stripTimestamps` failure)
+
+- [ ] **Step 4: Write the implementation**
+
+Create `internal/transcribe/whisper.go`:
+
+```go
+// Package transcribe converts voice notes to text by shelling out to
+// whisper.cpp.
+//
+// This is local by design: Claude does not accept audio, so transcription is a
+// separate component regardless, and running it locally costs nothing per
+// note, has no quota to exhaust, and keeps recordings on the machine.
+package transcribe
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"regexp"
+	"strings"
+	"time"
+)
+
+var ErrEmptyTranscript = errors.New("transcript was empty")
+
+// defaultTimeout bounds a single transcription. A voice note long enough to
+// exceed this is not a capture, and the capture path must never hang.
+const defaultTimeout = 3 * time.Minute
+
+type Transcriber struct {
+	bin     string
+	model   string
+	timeout time.Duration
+}
+
+func New(bin, model string) *Transcriber {
+	return &Transcriber{bin: bin, model: model, timeout: defaultTimeout}
+}
+
+// timestampLine matches whisper.cpp's default segment prefix.
+var timestampLine = regexp.MustCompile(`^\[\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\]\s*`)
+
+// stripTimestamps flattens whisper's segmented output into one line. It is
+// pure so it can be tested without the binary installed.
+func stripTimestamps(raw string) string {
+	var parts []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = timestampLine.ReplaceAllString(line, "")
+		if line = strings.TrimSpace(line); line != "" {
+			parts = append(parts, line)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// Transcribe runs whisper.cpp over audioPath and returns the flattened text.
+func (t *Transcriber) Transcribe(ctx context.Context, audioPath string) (string, error) {
+	if _, err := os.Stat(audioPath); err != nil {
+		return "", fmt.Errorf("audio file %s: %w", audioPath, err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, t.timeout)
+	defer cancel()
+
+	// --no-prints keeps whisper's banner off stdout; -nt would also drop the
+	// timestamps, but we strip them ourselves so the parser still works if a
+	// future version changes that flag.
+	cmd := exec.CommandContext(ctx, t.bin,
+		"--model", t.model,
+		"--file", audioPath,
+		"--output-txt", "false",
+		"--no-prints",
+	)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("transcription cancelled or timed out: %w", ctx.Err())
+		}
+		return "", fmt.Errorf("whisper failed: %w (stderr: %s)",
+			err, strings.TrimSpace(stderr.String()))
+	}
+
+	text := stripTimestamps(stdout.String())
+	if text == "" {
+		return "", ErrEmptyTranscript
+	}
+	return text, nil
+}
+```
+
+- [ ] **Step 5: Run the tests**
+
+Run: `go test ./internal/transcribe/ -v`
+
+Expected with whisper installed: PASS.
+Expected without: SKIP on the three integration tests with an actionable
+message, PASS on both `stripTimestamps` tests.
+
+If the flags are rejected, run `whisper-cli --help` and adjust — the binary is
+named `main` in some builds and `whisper-cli` in Homebrew's.
+
+- [ ] **Step 6: Document the prerequisite**
+
+Replace `README.md`:
+
+```markdown
+# Sous Chef
+
+A local-first pipeline for capturing recipe and video ideas, inferring their
+metadata with Claude, and organising the backlog. Capture from a web app or
+from Telegram, by text or by voice.
+
+## Prerequisites
+
+- Go 1.26+
+- Bun 1.3+
+- An Anthropic credential — either `ANTHROPIC_API_KEY` or an `ant auth login` profile
+- A Telegram bot token from [@BotFather](https://t.me/botfather)
+- whisper.cpp, for voice notes:
+
+```bash
+brew install whisper-cpp
+mkdir -p models
+curl -fsSL -o models/ggml-base.en.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+```
+
+## Setup
+
+```bash
+cp .env.example .env   # then fill in the values
+make build
+./bin/souschef
+```
+
+The app refuses to start if anything is missing, and names what. Open
+http://localhost:8420.
+
+## Development
+
+```bash
+make dev    # Go on :8420, Vite on :5173 with hot reload
+make test   # Go tests plus Playwright
+```
+
+## Telegram
+
+The token is all BotFather needs to provide — **the app publishes its own
+command list** on startup. Send it a message or a voice note to capture an
+idea, and `/s <query>` to search.
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add -A
+git commit -m "feat(transcribe): whisper.cpp wrapper for voice notes
+
+Local by design: Claude does not accept audio, so transcription is a
+separate component either way, and running it locally costs nothing per
+note and keeps recordings on the machine.
+
+Integration tests skip with an actionable install message when whisper is
+absent — it is a documented prerequisite, not a vendored dependency, and
+a fresh checkout must not fail on it. stripTimestamps is pure and stays
+covered regardless.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 15: Telegram client and command registry
+
+**Files:**
+- Create: `internal/telegram/client.go`, `internal/telegram/commands.go`, `internal/telegram/commands_test.go`
+
+**Interfaces:**
+- Consumes: `config.Config.TelegramToken`, `.TelegramChatID`.
+- Produces:
+  - `telegram.Client` with `GetUpdates`, `SendMessage`, `EditMessageText`, `AnswerCallbackQuery`, `GetFile`, `DownloadFile`, `GetMyCommands`, `SetMyCommands`
+  - `telegram.Command{Name, Args, Desc string; Handler HandlerFunc}`
+  - `telegram.Commands []Command` — the single source of truth
+  - `telegram.ValidateRegistry([]Command) error`
+  - `telegram.MenuFrom([]Command) []BotCommand`
+  - `telegram.HelpText([]Command) string`
+  - `telegram.Lookup(name string) (Command, bool)`
+
+- [ ] **Step 1: Write the failing test**
+
+Create `internal/telegram/commands_test.go`:
+
+```go
+package telegram
+
+import (
+	"regexp"
+	"strings"
+	"testing"
+)
+
+// Telegram's own constraints. A malformed entry must fail at startup rather
+// than at the setMyCommands call.
+var telegramName = regexp.MustCompile(`^[a-z0-9_]{1,32}$`)
+
+func TestRegistryMeetsTelegramConstraints(t *testing.T) {
+	if err := ValidateRegistry(Commands); err != nil {
+		t.Fatalf("the shipped registry must be valid: %v", err)
+	}
+
+	for _, c := range Commands {
+		if !telegramName.MatchString(c.Name) {
+			t.Errorf("name %q must be 1-32 chars of [a-z0-9_]", c.Name)
+		}
+		if n := len(c.Desc); n < 3 || n > 256 {
+			t.Errorf("description for /%s is %d chars, must be 3-256", c.Name, n)
+		}
+	}
+}
+
+// The invariant the design is built on: a command in the menu with no handler
+// must be impossible. Handler is a func field with no usable zero value, so
+// this is really a belt-and-braces check on the shipped slice.
+func TestEveryCommandHasAHandler(t *testing.T) {
+	for _, c := range Commands {
+		if c.Handler == nil {
+			t.Errorf("/%s appears in the registry with no handler", c.Name)
+		}
+	}
+}
+
+func TestValidateRegistryRejectsBadEntries(t *testing.T) {
+	cases := map[string][]Command{
+		"uppercase name":   {{Name: "Search", Desc: "Search ideas", Handler: noopHandler}},
+		"name with space":  {{Name: "find idea", Desc: "Search ideas", Handler: noopHandler}},
+		"empty name":       {{Name: "", Desc: "Search ideas", Handler: noopHandler}},
+		"short desc":       {{Name: "s", Desc: "hi", Handler: noopHandler}},
+		"missing handler":  {{Name: "s", Desc: "Search ideas"}},
+		"duplicate name": {
+			{Name: "s", Desc: "Search ideas", Handler: noopHandler},
+			{Name: "s", Desc: "Search again", Handler: noopHandler},
+		},
+	}
+
+	for label, registry := range cases {
+		if err := ValidateRegistry(registry); err == nil {
+			t.Errorf("%s should have been rejected", label)
+		}
+	}
+}
+
+func TestLookupFindsRegisteredCommands(t *testing.T) {
+	for _, c := range Commands {
+		if _, ok := Lookup(c.Name); !ok {
+			t.Errorf("Lookup(%q) failed for a registered command", c.Name)
+		}
+	}
+	if _, ok := Lookup("definitely_not_a_command"); ok {
+		t.Error("Lookup must not invent commands")
+	}
+}
+
+// The menu published to Telegram is derived from the registry, never written
+// by hand — that is what makes drift impossible.
+func TestMenuIsDerivedFromRegistry(t *testing.T) {
+	menu := MenuFrom(Commands)
+
+	if len(menu) != len(Commands) {
+		t.Fatalf("menu has %d entries, registry has %d", len(menu), len(Commands))
+	}
+	for i, c := range Commands {
+		if menu[i].Command != c.Name {
+			t.Errorf("menu[%d].Command = %q, want %q", i, menu[i].Command, c.Name)
+		}
+		if menu[i].Description != c.Desc {
+			t.Errorf("menu[%d].Description = %q, want %q", i, menu[i].Description, c.Desc)
+		}
+		// Args is documentation for /help only — Telegram has no parameter
+		// syntax, and including it would show literal "<query>" in the menu.
+		if strings.Contains(menu[i].Command, "<") {
+			t.Errorf("menu[%d].Command leaked Args: %q", i, menu[i].Command)
+		}
+	}
+}
+
+// /help must cover exactly the registry: no missing entries, no extras.
+func TestHelpTextCoversExactlyTheRegistry(t *testing.T) {
+	help := HelpText(Commands)
+
+	for _, c := range Commands {
+		if !strings.Contains(help, "/"+c.Name) {
+			t.Errorf("/help omits /%s", c.Name)
+		}
+		if !strings.Contains(help, c.Desc) {
+			t.Errorf("/help omits the description for /%s", c.Name)
+		}
+		if c.Args != "" && !strings.Contains(help, c.Args) {
+			t.Errorf("/help omits the argument hint %q for /%s", c.Args, c.Name)
+		}
+	}
+
+	// Count slash-prefixed lines to catch extras that are not in the registry.
+	lines := 0
+	for _, line := range strings.Split(help, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "/") {
+			lines++
+		}
+	}
+	if lines != len(Commands) {
+		t.Errorf("/help lists %d commands, registry has %d", lines, len(Commands))
+	}
+}
+
+func TestMenusEqualIgnoresOrder(t *testing.T) {
+	a := []BotCommand{{Command: "s", Description: "Search"}, {Command: "help", Description: "Help"}}
+	b := []BotCommand{{Command: "help", Description: "Help"}, {Command: "s", Description: "Search"}}
+
+	if !menusEqual(a, b) {
+		t.Error("menus differing only in order must compare equal — otherwise every restart writes to the API")
+	}
+	if menusEqual(a, []BotCommand{{Command: "s", Description: "Search ideas"}}) {
+		t.Error("a genuine difference must be detected")
+	}
+}
+```
+
+Add the no-op handler used by the rejection cases:
+
+```go
+func noopHandler(*Bot, Update, string) error { return nil }
+```
+
+- [ ] **Step 2: Run it to make sure it fails**
+
+Run: `go test ./internal/telegram/ -v`
+Expected: FAIL — `undefined: Commands`
+
+- [ ] **Step 3: Write the client**
+
+Create `internal/telegram/client.go`:
+
+```go
+// Package telegram implements the bot.
+//
+// There is no SDK here on purpose: we need seven Bot API methods, all plain
+// JSON over HTTPS. A small client avoids inheriting a dependency's release
+// cadence and keeps the long-poll timeout under our control.
+package telegram
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
+)
+
+const apiBase = "https://api.telegram.org"
+
+type Client struct {
+	token string
+	http  *http.Client
+}
+
+func NewClient(token string) *Client {
+	return &Client{
+		token: token,
+		// Longer than the long-poll timeout below, so getUpdates is never cut
+		// off by the transport.
+		http: &http.Client{Timeout: 90 * time.Second},
+	}
+}
+
+type apiResponse struct {
+	OK          bool            `json:"ok"`
+	Result      json.RawMessage `json:"result"`
+	Description string          `json:"description"`
+	ErrorCode   int             `json:"error_code"`
+}
+
+func (c *Client) call(ctx context.Context, method string, payload, out any) error {
+	var body io.Reader
+	if payload != nil {
+		buf, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal %s: %w", method, err)
+		}
+		body = bytes.NewReader(buf)
+	}
+
+	url := fmt.Sprintf("%s/bot%s/%s", apiBase, c.token, method)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
+	if err != nil {
+		return fmt.Errorf("build %s request: %w", method, err)
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s: %w", method, err)
+	}
+	defer resp.Body.Close()
+
+	var envelope apiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		return fmt.Errorf("decode %s response: %w", method, err)
+	}
+	if !envelope.OK {
+		return fmt.Errorf("%s failed: %d %s", method, envelope.ErrorCode, envelope.Description)
+	}
+	if out != nil {
+		if err := json.Unmarshal(envelope.Result, out); err != nil {
+			return fmt.Errorf("decode %s result: %w", method, err)
+		}
+	}
+	return nil
+}
+
+// --- wire types (only the fields we use) ---
+
+type Update struct {
+	UpdateID      int64          `json:"update_id"`
+	Message       *Message       `json:"message"`
+	CallbackQuery *CallbackQuery `json:"callback_query"`
+}
+
+type Message struct {
+	MessageID int64  `json:"message_id"`
+	Chat      Chat   `json:"chat"`
+	Text      string `json:"text"`
+	Voice     *Voice `json:"voice"`
+}
+
+type Chat struct {
+	ID int64 `json:"id"`
+}
+
+type Voice struct {
+	FileID   string `json:"file_id"`
+	Duration int    `json:"duration"`
+}
+
+type CallbackQuery struct {
+	ID      string   `json:"id"`
+	Data    string   `json:"data"`
+	Message *Message `json:"message"`
+}
+
+type InlineKeyboardButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data,omitempty"`
+	URL          string `json:"url,omitempty"`
+}
+
+type InlineKeyboardMarkup struct {
+	InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
+}
+
+type BotCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+// --- methods ---
+
+func (c *Client) GetUpdates(ctx context.Context, offset int64, timeoutSeconds int) ([]Update, error) {
+	var out []Update
+	err := c.call(ctx, "getUpdates", map[string]any{
+		"offset":          offset,
+		"timeout":         timeoutSeconds,
+		"allowed_updates": []string{"message", "callback_query"},
+	}, &out)
+	return out, err
+}
+
+func (c *Client) SendMessage(ctx context.Context, chatID int64, text string,
+	markup *InlineKeyboardMarkup) (Message, error) {
+
+	payload := map[string]any{
+		"chat_id":    chatID,
+		"text":       text,
+		"parse_mode": "HTML",
+	}
+	if markup != nil {
+		payload["reply_markup"] = markup
+	}
+
+	var out Message
+	err := c.call(ctx, "sendMessage", payload, &out)
+	return out, err
+}
+
+func (c *Client) EditMessageText(ctx context.Context, chatID, messageID int64, text string,
+	markup *InlineKeyboardMarkup) error {
+
+	payload := map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"text":       text,
+		"parse_mode": "HTML",
+	}
+	if markup != nil {
+		payload["reply_markup"] = markup
+	}
+	return c.call(ctx, "editMessageText", payload, nil)
+}
+
+func (c *Client) AnswerCallbackQuery(ctx context.Context, id, text string) error {
+	return c.call(ctx, "answerCallbackQuery",
+		map[string]any{"callback_query_id": id, "text": text}, nil)
+}
+
+func (c *Client) GetMyCommands(ctx context.Context, chatID int64) ([]BotCommand, error) {
+	var out []BotCommand
+	err := c.call(ctx, "getMyCommands", map[string]any{
+		"scope": map[string]any{"type": "chat", "chat_id": chatID},
+	}, &out)
+	return out, err
+}
+
+// SetMyCommands publishes the menu, scoped to the one chat allowed to use the
+// bot rather than to everyone who finds it.
+func (c *Client) SetMyCommands(ctx context.Context, chatID int64, commands []BotCommand) error {
+	return c.call(ctx, "setMyCommands", map[string]any{
+		"commands": commands,
+		"scope":    map[string]any{"type": "chat", "chat_id": chatID},
+	}, nil)
+}
+
+// DownloadFile resolves a file_id and writes the bytes into dir, returning the
+// local path.
+func (c *Client) DownloadFile(ctx context.Context, fileID, dir string) (string, error) {
+	var meta struct {
+		FilePath string `json:"file_path"`
+	}
+	if err := c.call(ctx, "getFile", map[string]any{"file_id": fileID}, &meta); err != nil {
+		return "", err
+	}
+
+	url := fmt.Sprintf("%s/file/bot%s/%s", apiBase, c.token, meta.FilePath)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("download %s: %w", fileID, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download %s: HTTP %d", fileID, resp.StatusCode)
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	// filepath.Base guards against a traversal via the server-supplied path.
+	dest := filepath.Join(dir, fileID+filepath.Ext(filepath.Base(meta.FilePath)))
+
+	f, err := os.Create(dest)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		return "", fmt.Errorf("write %s: %w", dest, err)
+	}
+	return dest, nil
+}
+```
+
+- [ ] **Step 4: Write the registry**
+
+Create `internal/telegram/commands.go`:
+
+```go
+package telegram
+
+import (
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+// HandlerFunc handles one command. args is everything after the command word.
+type HandlerFunc func(bot *Bot, update Update, args string) error
+
+// Command binds a command's name, its user-facing description, and its
+// handler in one place.
+type Command struct {
+	Name    string      // as typed, without the leading slash
+	Args    string      // documentation for /help only; Telegram has no parameter syntax
+	Desc    string      // shown in Telegram's command menu
+	Handler HandlerFunc
+}
+
+// Commands is the single source of truth for what this bot can do.
+//
+// Three consumers read this slice and nothing else: the menu published via
+// setMyCommands, the update router, and /help. BotFather is never used to
+// configure commands — it only issues the token.
+//
+// Because Handler has no usable zero value, a menu entry with no handler
+// cannot be written without failing validation at startup.
+var Commands = []Command{
+	{
+		Name:    "s",
+		Args:    "<query>",
+		Desc:    "Search your ideas",
+		Handler: handleSearch,
+	},
+	{
+		Name:    "recent",
+		Desc:    "Show your ten newest ideas",
+		Handler: handleRecent,
+	},
+	{
+		Name:    "help",
+		Desc:    "What this bot can do",
+		Handler: handleHelp,
+	},
+}
+
+var namePattern = regexp.MustCompile(`^[a-z0-9_]{1,32}$`)
+
+// ValidateRegistry checks the registry against Telegram's constraints so a
+// malformed entry fails at startup rather than at the API call.
+func ValidateRegistry(registry []Command) error {
+	seen := map[string]bool{}
+
+	for _, c := range registry {
+		if !namePattern.MatchString(c.Name) {
+			return fmt.Errorf("command %q: name must be 1-32 characters of lowercase letters, digits, and underscores", c.Name)
+		}
+		if seen[c.Name] {
+			return fmt.Errorf("command %q is registered twice", c.Name)
+		}
+		seen[c.Name] = true
+
+		if n := len(c.Desc); n < 3 || n > 256 {
+			return fmt.Errorf("command %q: description is %d characters, must be 3-256", c.Name, n)
+		}
+		if c.Handler == nil {
+			return fmt.Errorf("command %q has no handler", c.Name)
+		}
+	}
+	return nil
+}
+
+func Lookup(name string) (Command, bool) {
+	for _, c := range Commands {
+		if c.Name == name {
+			return c, true
+		}
+	}
+	return Command{}, false
+}
+
+// MenuFrom derives the Telegram menu. Args is deliberately excluded — it is
+// documentation for /help, and Telegram would render it literally.
+func MenuFrom(registry []Command) []BotCommand {
+	out := make([]BotCommand, 0, len(registry))
+	for _, c := range registry {
+		out = append(out, BotCommand{Command: c.Name, Description: c.Desc})
+	}
+	return out
+}
+
+// HelpText renders /help from the same slice, so the two can never disagree.
+func HelpText(registry []Command) string {
+	var b strings.Builder
+	b.WriteString("Send me any message to capture it as an idea. A voice note works too.\n\n")
+
+	for _, c := range registry {
+		b.WriteString("/" + c.Name)
+		if c.Args != "" {
+			b.WriteString(" " + c.Args)
+		}
+		b.WriteString(" — " + c.Desc + "\n")
+	}
+	return b.String()
+}
+
+// menusEqual compares order-independently, so a restart that changed nothing
+// does not write to a rate-limited API.
+func menusEqual(a, b []BotCommand) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	key := func(list []BotCommand) []string {
+		out := make([]string, 0, len(list))
+		for _, c := range list {
+			out = append(out, c.Command+"\x00"+c.Description)
+		}
+		sort.Strings(out)
+		return out
+	}
+	left, right := key(a), key(b)
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// SyncCommands publishes the menu only when it differs from what Telegram
+// already has, turning a real change into one log line and a no-op restart
+// into nothing at all.
+func SyncCommands(ctx context.Context, client *Client, chatID int64, registry []Command) (bool, error) {
+	if err := ValidateRegistry(registry); err != nil {
+		return false, err
+	}
+
+	want := MenuFrom(registry)
+
+	current, err := client.GetMyCommands(ctx, chatID)
+	if err != nil {
+		return false, fmt.Errorf("read current command menu: %w", err)
+	}
+	if menusEqual(current, want) {
+		return false, nil
+	}
+	if err := client.SetMyCommands(ctx, chatID, want); err != nil {
+		return false, fmt.Errorf("publish command menu: %w", err)
+	}
+	return true, nil
+}
+```
+
+Add `"context"` to the import block.
+
+- [ ] **Step 5: Run the tests**
+
+Run: `go test ./internal/telegram/ -v`
+
+Expected: FAIL on `undefined: handleSearch` and friends — those arrive in Task
+16. Comment out the three registry entries temporarily to confirm the
+validation, menu, and help tests pass, then restore them and move on.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add internal/telegram
+git commit -m "feat(telegram): API client and command registry
+
+No SDK: seven Bot API methods over plain JSON, so we do not inherit a
+dependency's release cadence and the long-poll timeout stays ours.
+
+The registry binds name, description, and handler in one slice, and the
+menu, the router, and /help are all derived from it. Handler has no
+usable zero value, so a menu entry with no handler fails validation at
+startup. BotFather only issues the token.
+
+SyncCommands compares against getMyCommands first: a no-op restart writes
+nothing to a rate-limited API, and a real change produces one log line.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 16: Telegram capture — text and voice
+
+**Files:**
+- Create: `internal/telegram/bot.go`, `internal/telegram/bot_test.go`
+- Modify: `cmd/souschef/main.go`
+
+**Interfaces:**
+- Consumes: everything from Tasks 6, 7, 14, 15.
+- Produces: `telegram.Bot`; `telegram.New(deps Deps) (*Bot, error)`; `(*Bot).Run(ctx) error`; `telegram.Deps{Client, Ideas, Enricher, Transcriber, ChatID, AudioDir, WebBaseURL}`; `telegram.RenderIdeaCard(idea) (string, *InlineKeyboardMarkup)`.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `internal/telegram/bot_test.go`:
+
+```go
+package telegram
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/erikhoward/souschef/internal/ideas"
+)
+
+func enrichedIdea() ideas.Idea {
+	at := time.Now()
+	return ideas.Idea{
+		ID:      "0191f0c2-1234-7890-abcd-ef0123456789",
+		Title:   "Crispy chili eggs with scallion oil",
+		RawText: "chili crisp eggs, scallion oil, fast",
+		Stage:   ideas.StageIdea,
+		Metadata: ideas.Metadata{
+			Difficulty: "easy", DurationClass: "quick",
+			Treatment: "elevated", Cuisine: "Chinese-inspired",
+		},
+		Enrichment: ideas.Enrichment{Status: ideas.EnrichOK, EnrichedAt: &at},
+	}
+}
+
+func TestRenderIdeaCardShowsMetadata(t *testing.T) {
+	text, markup := RenderIdeaCard(enrichedIdea(), "http://localhost:8420")
+
+	for _, want := range []string{"Crispy chili eggs", "Easy", "Quick", "Elevated", "Chinese-inspired"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("card omits %q:\n%s", want, text)
+		}
+	}
+	if markup == nil || len(markup.InlineKeyboard) == 0 {
+		t.Fatal("an enriched card must carry an Open button")
+	}
+}
+
+// No ID is ever shown, copied, or pasted. That was the defect in the previous
+// iteration and it must not reappear.
+func TestRenderIdeaCardNeverShowsRawID(t *testing.T) {
+	idea := enrichedIdea()
+	text, _ := RenderIdeaCard(idea, "http://localhost:8420")
+
+	if strings.Contains(text, idea.ID) {
+		t.Errorf("card leaks the raw id into visible text:\n%s", text)
+	}
+}
+
+func TestRenderIdeaCardDeepLinksToTheWebApp(t *testing.T) {
+	idea := enrichedIdea()
+	_, markup := RenderIdeaCard(idea, "http://localhost:8420")
+
+	var found string
+	for _, row := range markup.InlineKeyboard {
+		for _, button := range row {
+			if button.URL != "" {
+				found = button.URL
+			}
+		}
+	}
+	want := "http://localhost:8420/ideas/" + idea.ID
+	if found != want {
+		t.Errorf("deep link = %q, want %q", found, want)
+	}
+}
+
+func TestRenderIdeaCardPendingSaysReading(t *testing.T) {
+	idea := enrichedIdea()
+	idea.Enrichment = ideas.Enrichment{Status: ideas.EnrichPending}
+
+	text, _ := RenderIdeaCard(idea, "http://localhost:8420")
+	if !strings.Contains(strings.ToLower(text), "reading") {
+		t.Errorf("a pending card should say it is still reading:\n%s", text)
+	}
+}
+
+func TestRenderIdeaCardFailedShowsErrorAndRetry(t *testing.T) {
+	idea := enrichedIdea()
+	idea.Enrichment = ideas.Enrichment{
+		Status: ideas.EnrichFailed,
+		Error:  "401 authentication_error: invalid x-api-key",
+	}
+
+	text, markup := RenderIdeaCard(idea, "http://localhost:8420")
+	if !strings.Contains(text, "401") {
+		t.Errorf("a failed card must show the message:\n%s", text)
+	}
+
+	var hasRetry bool
+	for _, row := range markup.InlineKeyboard {
+		for _, button := range row {
+			if strings.Contains(strings.ToLower(button.Text), "retry") {
+				hasRetry = true
+			}
+		}
+	}
+	if !hasRetry {
+		t.Error("a failed card must offer Retry")
+	}
+}
+
+func TestParseCommandSplitsNameAndArgs(t *testing.T) {
+	cases := []struct{ in, name, args string }{
+		{"/s shawarma", "s", "shawarma"},
+		{"/s  lots   of  words ", "s", "lots   of  words"},
+		{"/recent", "recent", ""},
+		{"/help", "help", ""},
+		{"/s@souschef_bot shawarma", "s", "shawarma"}, // group-style mention
+		{"not a command", "", ""},
+		{"", "", ""},
+	}
+
+	for _, c := range cases {
+		name, args := parseCommand(c.in)
+		if name != c.name || args != c.args {
+			t.Errorf("parseCommand(%q) = (%q, %q), want (%q, %q)", c.in, name, args, c.name, c.args)
+		}
+	}
+}
+
+func TestEscapeHTMLPreventsMarkupInjection(t *testing.T) {
+	// An idea title is user-supplied and lands in an HTML-parsed message.
+	got := escapeHTML(`<b>bold</b> & "quoted"`)
+	for _, forbidden := range []string{"<b>", "</b>"} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("escapeHTML left %q in %q", forbidden, got)
+		}
+	}
+	if !strings.Contains(got, "&amp;") {
+		t.Errorf("escapeHTML did not escape &: %q", got)
+	}
+}
+```
+
+- [ ] **Step 2: Run it to make sure it fails**
+
+Run: `go test ./internal/telegram/ -run TestRender -v`
+Expected: FAIL — `undefined: RenderIdeaCard`
+
+- [ ] **Step 3: Write the bot**
+
+Create `internal/telegram/bot.go`:
+
+```go
+package telegram
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/erikhoward/souschef/internal/ideas"
+)
+
+type Enricher interface {
+	Enrich(ctx context.Context, rawText string) (ideas.Metadata, error)
+}
+
+type Transcriber interface {
+	Transcribe(ctx context.Context, audioPath string) (string, error)
+}
+
+type Deps struct {
+	Client      *Client
+	Ideas       *ideas.Service
+	Enricher    Enricher
+	Transcriber Transcriber
+	ChatID      int64
+	AudioDir    string
+	WebBaseURL  string
+}
+
+type Bot struct {
+	Deps
+	offset int64
+}
+
+func New(deps Deps) (*Bot, error) {
+	if err := ValidateRegistry(Commands); err != nil {
+		return nil, err
+	}
+	return &Bot{Deps: deps}, nil
+}
+
+const longPollSeconds = 30
+
+// Run polls for updates until ctx is cancelled.
+func (b *Bot) Run(ctx context.Context) error {
+	// Publish the menu, but never let a sync failure stop the bot: a stale
+	// menu costs discoverability, whereas refusing to run costs capture.
+	changed, err := SyncCommands(ctx, b.Client, b.ChatID, Commands)
+	switch {
+	case err != nil:
+		log.Printf("telegram: command menu not synced: %v", err)
+	case changed:
+		log.Printf("telegram: published %d commands", len(Commands))
+	default:
+		log.Printf("telegram: command menu already current")
+	}
+
+	log.Printf("telegram: listening (chat %d)", b.ChatID)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		updates, err := b.Client.GetUpdates(ctx, b.offset, longPollSeconds)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			log.Printf("telegram: getUpdates: %v", err)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
+
+		for _, update := range updates {
+			b.offset = update.UpdateID + 1
+			if err := b.handle(ctx, update); err != nil {
+				log.Printf("telegram: handle update %d: %v", update.UpdateID, err)
+			}
+		}
+	}
+}
+
+// authorised drops anything from a chat that is not the configured one.
+func (b *Bot) authorised(update Update) bool {
+	switch {
+	case update.Message != nil:
+		return update.Message.Chat.ID == b.ChatID
+	case update.CallbackQuery != nil && update.CallbackQuery.Message != nil:
+		return update.CallbackQuery.Message.Chat.ID == b.ChatID
+	default:
+		return false
+	}
+}
+
+func (b *Bot) handle(ctx context.Context, update Update) error {
+	if !b.authorised(update) {
+		log.Printf("telegram: dropped update from an unauthorised chat")
+		return nil
+	}
+
+	if update.CallbackQuery != nil {
+		return b.handleCallback(ctx, update)
+	}
+	if update.Message == nil {
+		return nil
+	}
+	if update.Message.Voice != nil {
+		return b.handleVoice(ctx, update)
+	}
+
+	text := strings.TrimSpace(update.Message.Text)
+	if text == "" {
+		return nil
+	}
+
+	if name, args := parseCommand(text); name != "" {
+		cmd, ok := Lookup(name)
+		if !ok {
+			// An unknown command answers with help rather than being
+			// silently swallowed.
+			_, err := b.Client.SendMessage(ctx, b.ChatID,
+				"I don't know /"+escapeHTML(name)+".\n\n"+HelpText(Commands), nil)
+			return err
+		}
+		return cmd.Handler(b, update, args)
+	}
+
+	return b.capture(ctx, text, ideas.SourceTelegramText,
+		fmt.Sprint(update.Message.MessageID))
+}
+
+// parseCommand splits "/name args" into its parts. It tolerates the
+// "/name@botname" form Telegram uses in groups.
+func parseCommand(text string) (name, args string) {
+	if !strings.HasPrefix(text, "/") {
+		return "", ""
+	}
+	body := strings.TrimPrefix(text, "/")
+
+	head, rest, _ := strings.Cut(body, " ")
+	if head == "" {
+		return "", ""
+	}
+	if at := strings.IndexByte(head, '@'); at >= 0 {
+		head = head[:at]
+	}
+	return head, strings.TrimSpace(rest)
+}
+
+func escapeHTML(s string) string {
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;")
+	return r.Replace(s)
+}
+
+// capture saves an idea, replies immediately, and enriches in the background,
+// editing the same message in place when the result arrives.
+func (b *Bot) capture(ctx context.Context, rawText string, source ideas.Source, ref string) error {
+	idea, err := b.Ideas.Create(ctx, rawText, source, ref)
+	if err != nil {
+		_, sendErr := b.Client.SendMessage(ctx, b.ChatID, "Could not save that: "+escapeHTML(err.Error()), nil)
+		return sendErr
+	}
+
+	sent, err := b.Client.SendMessage(ctx, b.ChatID,
+		"✓ Saved. <i>Reading it now…</i>", nil)
+	if err != nil {
+		return err
+	}
+
+	go b.enrichAndEdit(idea.ID, idea.RawText, sent.MessageID)
+	return nil
+}
+
+// enrichAndEdit classifies the idea and rewrites the original message.
+// Editing in place, rather than sending a second message, keeps the chat at
+// one message per idea — which matters when the chat is the phone-side view
+// of the backlog.
+func (b *Bot) enrichAndEdit(ideaID, rawText string, messageID int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	var updated ideas.Idea
+
+	meta, err := b.Enricher.Enrich(ctx, rawText)
+	if err != nil {
+		updated, err = b.Ideas.RecordEnrichmentFailure(ctx, ideaID, err.Error())
+	} else {
+		updated, err = b.Ideas.ApplyEnrichment(ctx, ideaID, meta, "")
+	}
+	if err != nil {
+		log.Printf("telegram: record enrichment for %s: %v", ideaID, err)
+		return
+	}
+
+	text, markup := RenderIdeaCard(updated, b.WebBaseURL)
+	if err := b.Client.EditMessageText(ctx, b.ChatID, messageID, text, markup); err != nil {
+		log.Printf("telegram: edit message %d: %v", messageID, err)
+	}
+}
+
+func (b *Bot) handleVoice(ctx context.Context, update Update) error {
+	sent, err := b.Client.SendMessage(ctx, b.ChatID, "🎙 <i>Transcribing…</i>", nil)
+	if err != nil {
+		return err
+	}
+
+	path, err := b.Client.DownloadFile(ctx, update.Message.Voice.FileID, b.AudioDir)
+	if err != nil {
+		return b.Client.EditMessageText(ctx, b.ChatID, sent.MessageID,
+			"Could not download that voice note: "+escapeHTML(err.Error()), nil)
+	}
+
+	text, err := b.Transcriber.Transcribe(ctx, path)
+	if err != nil {
+		return b.Client.EditMessageText(ctx, b.ChatID, sent.MessageID,
+			"Could not transcribe that: "+escapeHTML(err.Error()), nil)
+	}
+
+	idea, err := b.Ideas.Create(ctx, text, ideas.SourceTelegramVoice,
+		fmt.Sprint(update.Message.MessageID))
+	if err != nil {
+		return b.Client.EditMessageText(ctx, b.ChatID, sent.MessageID,
+			"Could not save that: "+escapeHTML(err.Error()), nil)
+	}
+
+	if err := b.Client.EditMessageText(ctx, b.ChatID, sent.MessageID,
+		"✓ Saved: <i>"+escapeHTML(text)+"</i>\n\n<i>Reading it now…</i>", nil); err != nil {
+		return err
+	}
+
+	go b.enrichAndEdit(idea.ID, idea.RawText, sent.MessageID)
+	return nil
+}
+
+var difficultyLabels = map[string]string{"easy": "Easy", "moderate": "Moderate", "insane": "Insane"}
+var durationLabels = map[string]string{"quick": "Quick", "average": "Average", "multi_day": "Multi-day"}
+var treatmentLabels = map[string]string{"elevated": "Elevated", "non_elevated": "Everyday"}
+
+// RenderIdeaCard builds the message body and keyboard for one idea. The id
+// appears only inside callback_data and the deep link, never in visible text.
+func RenderIdeaCard(idea ideas.Idea, webBaseURL string) (string, *InlineKeyboardMarkup) {
+	var b strings.Builder
+	b.WriteString("<b>" + escapeHTML(idea.Title) + "</b>\n")
+
+	buttons := []InlineKeyboardButton{}
+
+	switch idea.Enrichment.Status {
+	case ideas.EnrichPending:
+		b.WriteString("<i>Reading it now…</i>")
+
+	case ideas.EnrichFailed:
+		b.WriteString("⚠️ Could not read it: " + escapeHTML(idea.Enrichment.Error))
+		buttons = append(buttons, InlineKeyboardButton{
+			Text: "Retry", CallbackData: "retry:" + idea.ID,
+		})
+
+	default:
+		parts := []string{}
+		for _, v := range []string{
+			difficultyLabels[idea.Metadata.Difficulty],
+			durationLabels[idea.Metadata.DurationClass],
+			treatmentLabels[idea.Metadata.Treatment],
+			idea.Metadata.Cuisine,
+		} {
+			if v != "" {
+				parts = append(parts, escapeHTML(v))
+			}
+		}
+		b.WriteString(strings.Join(parts, " · "))
+	}
+
+	if webBaseURL != "" {
+		buttons = append(buttons, InlineKeyboardButton{
+			Text: "Open", URL: webBaseURL + "/ideas/" + idea.ID,
+		})
+	}
+
+	if len(buttons) == 0 {
+		return b.String(), nil
+	}
+	return b.String(), &InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{buttons}}
+}
+```
+
+- [ ] **Step 4: Run the tests**
+
+Run: `go test ./internal/telegram/ -run 'TestRender|TestParse|TestEscape' -v`
+Expected: PASS. The registry tests still fail on the missing handlers; Task 17
+adds them.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/telegram
+git commit -m "feat(telegram): capture by text and voice with edit-in-place
+
+Saving replies immediately and enrichment rewrites the same message via
+editMessageText, so the chat stays at one message per idea and mirrors
+the SSE behaviour in the web app.
+
+Cards never render a raw id — it lives only in callback_data and the deep
+link. Titles are HTML-escaped because they are user-supplied text landing
+in an HTML-parsed message.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 17: Telegram search, callbacks, wiring, and end-to-end
+
+**Files:**
+- Create: `internal/telegram/handlers.go`, `web/tests/capture.spec.js`, `web/playwright.config.js`
+- Modify: `cmd/souschef/main.go`, `PROJECT_LOG.md`
+
+**Interfaces:**
+- Consumes: everything.
+- Produces: `handleSearch`, `handleRecent`, `handleHelp`, `(*Bot).handleCallback`; a Playwright suite; a merged branch.
+
+- [ ] **Step 1: Write the handlers**
+
+Create `internal/telegram/handlers.go`:
+
+```go
+package telegram
+
+import (
+	"context"
+	"strings"
+
+	"github.com/erikhoward/souschef/internal/ideas"
+)
+
+const maxResults = 5
+
+// resultsKeyboard turns a result set into tappable buttons. This is the whole
+// point of the redesign: the previous iteration made you copy and paste ids.
+func resultsKeyboard(results []ideas.Idea) *InlineKeyboardMarkup {
+	rows := make([][]InlineKeyboardButton, 0, len(results))
+	for _, idea := range results {
+		label := idea.Title
+		if len(label) > 48 {
+			label = label[:47] + "…"
+		}
+		rows = append(rows, []InlineKeyboardButton{{
+			Text:         label,
+			CallbackData: "open:" + idea.ID,
+		}})
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	return &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+func handleSearch(b *Bot, update Update, args string) error {
+	ctx := context.Background()
+
+	query := strings.TrimSpace(args)
+	if query == "" {
+		_, err := b.Client.SendMessage(ctx, b.ChatID,
+			"Give me something to search for — for example: <code>/s shawarma</code>", nil)
+		return err
+	}
+
+	results, err := b.Ideas.List(ctx, ideas.ListFilter{Query: query, Limit: maxResults})
+	if err != nil {
+		_, sendErr := b.Client.SendMessage(ctx, b.ChatID,
+			"Search failed: "+escapeHTML(err.Error()), nil)
+		return sendErr
+	}
+	if len(results) == 0 {
+		_, err := b.Client.SendMessage(ctx, b.ChatID,
+			"Nothing matches “"+escapeHTML(query)+"”.", nil)
+		return err
+	}
+
+	_, err = b.Client.SendMessage(ctx,
+		b.ChatID,
+		"Tap one to open it:",
+		resultsKeyboard(results))
+	return err
+}
+
+func handleRecent(b *Bot, update Update, _ string) error {
+	ctx := context.Background()
+
+	results, err := b.Ideas.List(ctx, ideas.ListFilter{Sort: "created_at", Order: "desc", Limit: 10})
+	if err != nil {
+		_, sendErr := b.Client.SendMessage(ctx, b.ChatID,
+			"Could not load your backlog: "+escapeHTML(err.Error()), nil)
+		return sendErr
+	}
+	if len(results) == 0 {
+		_, err := b.Client.SendMessage(ctx, b.ChatID,
+			"Nothing captured yet. Send me anything and I'll save it.", nil)
+		return err
+	}
+
+	_, err = b.Client.SendMessage(ctx, b.ChatID, "Your ten newest:", resultsKeyboard(results))
+	return err
+}
+
+func handleHelp(b *Bot, update Update, _ string) error {
+	_, err := b.Client.SendMessage(context.Background(), b.ChatID, HelpText(Commands), nil)
+	return err
+}
+
+// handleCallback services the inline keyboard. Callbacks are not commands:
+// they arrive as callback_data, never as typed text, and Telegram has no menu
+// concept for them — which is why they are not in the registry.
+func (b *Bot) handleCallback(ctx context.Context, update Update) error {
+	query := update.CallbackQuery
+	action, id, found := strings.Cut(query.Data, ":")
+	if !found {
+		return b.Client.AnswerCallbackQuery(ctx, query.ID, "")
+	}
+
+	switch action {
+	case "open":
+		idea, err := b.Ideas.Get(ctx, id)
+		if err != nil {
+			return b.Client.AnswerCallbackQuery(ctx, query.ID, "That idea is gone.")
+		}
+		if err := b.Client.AnswerCallbackQuery(ctx, query.ID, ""); err != nil {
+			return err
+		}
+		text, markup := RenderIdeaCard(idea, b.WebBaseURL)
+		_, err = b.Client.SendMessage(ctx, b.ChatID, text, markup)
+		return err
+
+	case "retry":
+		idea, err := b.Ideas.Get(ctx, id)
+		if err != nil {
+			return b.Client.AnswerCallbackQuery(ctx, query.ID, "That idea is gone.")
+		}
+		if err := b.Client.AnswerCallbackQuery(ctx, query.ID, "Retrying…"); err != nil {
+			return err
+		}
+		if _, err := b.Ideas.MarkPending(ctx, id); err != nil {
+			return err
+		}
+		go b.enrichAndEdit(idea.ID, idea.RawText, query.Message.MessageID)
+		return nil
+
+	default:
+		return b.Client.AnswerCallbackQuery(ctx, query.ID, "")
+	}
+}
+```
+
+- [ ] **Step 2: Run the full telegram suite**
+
+Run: `go test ./internal/telegram/ -race -v`
+Expected: PASS — including every registry test from Task 15.
+
+- [ ] **Step 3: Wire the bot into main**
+
+Modify `cmd/souschef/main.go`. Add the imports and, after the HTTP server
+goroutine, before `<-ctx.Done()`:
+
+```go
+	telegramClient := telegram.NewClient(cfg.TelegramToken)
+	bot, err := telegram.New(telegram.Deps{
+		Client:      telegramClient,
+		Ideas:       ideaService,
+		Enricher:    enricher,
+		Transcriber: transcribe.New(cfg.WhisperBin, cfg.WhisperModel),
+		ChatID:      cfg.TelegramChatID,
+		AudioDir:    cfg.AudioDir,
+		WebBaseURL:  fmt.Sprintf("http://127.0.0.1:%d", cfg.Port),
+	})
+	if err != nil {
+		return fmt.Errorf("telegram: %w", err)
+	}
+
+	go func() {
+		if err := bot.Run(ctx); err != nil {
+			log.Printf("telegram: %v", err)
+		}
+	}()
+```
+
+This requires hoisting `ideaService` and `enricher` into named variables where
+the `httpapi.Deps` literal currently builds them inline:
+
+```go
+	ideaService := ideas.NewService(st)
+	enricher := enrich.New(cfg.Model, cfg.Effort)
+
+	api := httpapi.New(httpapi.Deps{
+		Ideas:    ideaService,
+		Enricher: enricher,
+		Hub:      hub,
+	})
+```
+
+- [ ] **Step 4: Build and verify the Telegram loop by hand**
+
+```bash
+make build && ./bin/souschef
+```
+
+Expected in the log: `telegram: published 3 commands` on the first run, then
+`telegram: command menu already current` on every subsequent start. In the
+Telegram app, typing `/` must show the three commands **without any BotFather
+configuration** — this is done-definition item 5.
+
+Then, in the chat:
+1. Send `sheet pan shawarma with lemony feta` → "✓ Saved. Reading it now…" then the same message becomes a metadata card with an Open button.
+2. Send a voice note → "🎙 Transcribing…" → the transcript → the card.
+3. Send `/s shawarma` → tappable results. Tap one; it opens without you seeing an ID.
+4. Tap Open → the browser lands on `/ideas/<id>` and the idea is selected.
+
+- [ ] **Step 5: Write the Playwright config**
+
+Create `web/playwright.config.js`:
+
+```js
+import { defineConfig } from '@playwright/test';
+
+export default defineConfig({
+  testDir: './tests',
+  timeout: 30_000,
+  use: { baseURL: 'http://127.0.0.1:8420', trace: 'retain-on-failure' },
+  // Test the real binary, not the dev server: the embedded-asset path and
+  // the SPA fallback only exist in the built artifact.
+  webServer: {
+    command: '../bin/souschef',
+    url: 'http://127.0.0.1:8420',
+    reuseExistingServer: !process.env.CI,
+    timeout: 20_000,
+  },
+});
+```
+
+- [ ] **Step 6: Write the end-to-end spec**
+
+Create `web/tests/capture.spec.js`:
+
+```js
+import { expect, test } from '@playwright/test';
+
+// The core loop from the definition of done. Enrichment needs a real
+// credential, so the metadata assertion is conditional — but capture,
+// search, archive, and restore must pass unconditionally.
+const hasCredential = Boolean(process.env.ANTHROPIC_API_KEY);
+
+test('capture appears immediately and is searchable', async ({ page }) => {
+  await page.goto('/ideas');
+
+  const unique = `shawarma-${Date.now()}`;
+  await page.fill('.capture-control textarea', `sheet pan ${unique} with lemony feta`);
+  await page.click('button:has-text("Save idea")');
+
+  // Instant: the row must not wait on the network.
+  await expect(page.locator('.idea-row').first()).toContainText(unique, { timeout: 2000 });
+
+  await page.fill('input[aria-label="Search ideas"]', unique);
+  await expect(page.locator('.idea-row')).toHaveCount(1);
+});
+
+test('archive hides the idea and restore brings it back', async ({ page }) => {
+  await page.goto('/ideas');
+
+  const unique = `archivable-${Date.now()}`;
+  await page.fill('.capture-control textarea', unique);
+  await page.click('button:has-text("Save idea")');
+  await expect(page.locator('.idea-row').first()).toContainText(unique);
+
+  await page.click('.idea-row:first-child');
+  await page.click('button:has-text("Archive")');
+  await expect(page.locator('.idea-row', { hasText: unique })).toHaveCount(0);
+
+  await page.click('button:has-text("Archived")');
+  await expect(page.locator('.idea-row', { hasText: unique })).toHaveCount(1);
+
+  await page.click('.idea-row:first-child');
+  await page.click('button:has-text("Restore")');
+});
+
+test('a deep link to a single idea loads directly', async ({ page }) => {
+  await page.goto('/ideas');
+
+  const unique = `deeplink-${Date.now()}`;
+  await page.fill('.capture-control textarea', unique);
+  await page.click('button:has-text("Save idea")');
+  await expect(page.locator('.idea-row').first()).toContainText(unique);
+
+  // The URL became /ideas/<id> on save. A hard reload must still work —
+  // this is what Telegram's Open button relies on.
+  const url = page.url();
+  expect(url).toMatch(/\/ideas\/[0-9a-f-]{36}$/);
+
+  await page.goto(url);
+  await expect(page.locator('.inspector')).toContainText(unique);
+});
+
+test('a correction is marked and persists across a reload', async ({ page }) => {
+  await page.goto('/ideas');
+
+  const unique = `correctable-${Date.now()}`;
+  await page.fill('.capture-control textarea', unique);
+  await page.click('button:has-text("Save idea")');
+  await expect(page.locator('.idea-row').first()).toContainText(unique);
+  await page.click('.idea-row:first-child');
+
+  await page.selectOption('select[aria-label="Difficulty"]', 'insane');
+  await expect(page.locator('.override-mark')).toHaveCount(1);
+
+  await page.reload();
+  await expect(page.locator('select[aria-label="Difficulty"]')).toHaveValue('insane');
+});
+
+test.describe('with a live credential', () => {
+  test.skip(!hasCredential, 'ANTHROPIC_API_KEY not set');
+
+  test('metadata fills in over SSE without a refresh', async ({ page }) => {
+    await page.goto('/ideas');
+
+    const unique = `enriched-${Date.now()}`;
+    await page.fill('.capture-control textarea',
+      `crispy chili eggs with scallion oil ${unique}, quick weeknight thing`);
+    await page.click('button:has-text("Save idea")');
+
+    const row = page.locator('.idea-row').first();
+    await expect(row).toContainText('Reading');
+    // No reload anywhere in this test — SSE must deliver it.
+    await expect(row.locator('.meta-value').first()).toBeVisible({ timeout: 30_000 });
+  });
+});
+```
+
+- [ ] **Step 7: Install Playwright and run the suite**
+
+```bash
+cd web
+bun add -d @playwright/test
+bunx playwright install chromium
+cd .. && make build
+cd web && bunx playwright test
+```
+
+Expected: four tests pass, one skipped without a credential.
+
+- [ ] **Step 8: Run everything**
+
+```bash
+make test
+```
+
+Expected: all Go packages pass with `-race`, all Playwright tests pass.
+
+- [ ] **Step 9: Walk the definition of done**
+
+Check each item from the spec against the running app, and fix anything that
+fails before merging:
+
+1. `make build` produces one binary serving UI and API on one port.
+2. Web capture is on screen in under 50ms, enriched within ~5s, no refresh.
+3. Same from Telegram, text and voice.
+4. `/s <query>` returns tappable results — no IDs.
+5. The command menu is populated by the app; `/help` matches it.
+6. List, search, filter, sort, notes, links, merge, archive, restore, delete.
+7. Every inferred field is correctable, and correcting protects it.
+8. A dead key shows a visible error with a working Retry.
+9. `make test` passes.
+10. `PROJECT_LOG.md` is current.
+
+- [ ] **Step 10: Update PROJECT_LOG.md**
+
+Set version to `1.0.0`, move Milestone 1 to **Complete**, and add to the Log:
+
+```markdown
+**2026-08-06** — Milestone 1 complete and merged. Go backend with SQLite +
+FTS5, Claude Sonnet 5 enrichment, single binary with embedded React and SSE,
+Telegram capture by text and voice with tappable search. Record here whether
+prompt caching engaged (`cache_read_input_tokens` non-zero on a second run)
+and the observed enrichment latency.
+```
+
+- [ ] **Step 11: Commit and merge**
+
+```bash
+git add -A
+git commit -m "feat(telegram): tappable search, callbacks, and end-to-end suite
+
+Search returns an inline keyboard keyed by callback_data, so an idea is
+opened by tapping it. No id is ever displayed or pasted — the defect that
+made the Telegram-first iteration unusable.
+
+Callbacks stay out of the command registry: they arrive as callback_data,
+never as typed text, and Telegram has no menu concept for them.
+
+Playwright runs against the built binary rather than the dev server,
+because the embedded assets and the SPA fallback only exist there.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+
+git checkout main
+git merge --no-ff feat/milestone-1-capture -m "Merge Milestone 1: capture and organize
+
+Capture from web or Telegram by text or voice, Claude-inferred metadata
+arriving over SSE without a refresh, and a searchable, correctable
+backlog. Single binary, local-first.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+git push origin main
+```
+
+- [ ] **Step 12: Stop for approval**
+
+Milestone 1 is complete. Do not begin Milestone 2 (brief generation) until
+Erik has reviewed and approved.
+
+---
+
+## Self-Review
+
+Checked against the spec on 2026-08-06.
+
+**Spec coverage.** Every section maps to a task: §3 repo layout → Task 1; §3
+package boundaries → Tasks 2–9; §4 data model → Tasks 3–6; §5 capture and
+enrichment → Tasks 7–8; §6 HTTP API → Tasks 8–9; §7 Telegram → Tasks 14–17;
+§8 frontend → Tasks 11–13; §9 testing → distributed across every task plus
+Task 17; §10 configuration → Task 2; §11 definition of done → Task 17 Step 9.
+
+**Deliberate omission.** The spec's §6 lists `DELETE /api/notes/:id`. No task
+implements it — the inspector has no delete-note control, so wiring the
+endpoint would ship dead code. Note deletion belongs with note editing in a
+later milestone. Everything else in §6 is covered.
+
+**Type consistency.** `ideas.Idea`, `ideas.Metadata`, `ideas.ListFilter`, and
+`store.ErrNotFound` are defined in Tasks 4 and 6 and used with the same
+signatures in Tasks 8, 15, 16, and 17. `httpapi.Enricher` and
+`telegram.Enricher` are separate one-method interfaces over the same
+`enrich.Enricher` — deliberate, so each package declares only what it needs
+and both stay testable with a stub.
+
+**One thing removed during review.** An earlier draft seeded a deliberate typo
+into the Task 11 token sheet as a "read this, don't paste it" check. That was
+wrong: a plan is meant to be executed faithfully, and a malformed CSS custom
+property fails silently in the browser. Anything worth catching belongs in a
+test, not in a trap. Removed.
+
+**Known sharp edges for the implementer.** Three places where the first
+attempt is likely to fail and the plan says so inline rather than pretending
+otherwise: the `go:embed` relative paths in Tasks 3 and 10 (fallback shape
+given), the Anthropic Go SDK type names in Task 7 (compile-fix loop, not
+research), and whisper.cpp's flag names in Task 14, which differ between the
+Homebrew build and a source build.
+
 | 8 | `httpapi`: REST routes and JSON |
 | 9 | `httpapi`: SSE hub with reconnect |
 | 10 | `httpapi`: embed `web/dist`, single-binary serving, graceful shutdown |
