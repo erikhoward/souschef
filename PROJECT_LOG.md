@@ -6,17 +6,19 @@ Breadcrumb trail for project state, version, and context. Read this before start
 
 ## Current state
 
-**Version:** 1.0.0-rc1 (Milestone 1 code-complete, NOT yet merged)
-**Phase:** Milestone 1 fully implemented and verified on `feat/milestone-1-capture`; awaiting Erik's review and approval to merge into `main`
-**Branch:** `feat/milestone-1-capture` (not yet merged — `main` is still at the pre-implementation commit)
+**Version:** 1.0.0 — Milestone 1 shipped, merged to `main`, and confirmed working in real use
+**Phase:** Milestone 1 complete. Milestone 2 (brief generation) not started; it begins only when Erik asks.
+**Branch:** `main` (merged and pushed; no feature branches outstanding)
 
-**What exists right now (on the feature branch, unmerged):**
+**What exists right now:**
 - Go backend (`cmd/souschef`, `internal/...`): SQLite + FTS5 storage, `internal/ideas` CRUD/search/merge/archive service, Claude Sonnet 5 enrichment (`internal/enrich`), whisper.cpp transcription wrapper (`internal/transcribe`), REST + SSE API (`internal/httpapi`), single-binary embedded-React serving with SPA fallback, graceful shutdown with an enrichment drain.
 - Telegram bot (`internal/telegram`): text and voice capture, edit-in-place enrichment, `/s <query>` and `/recent` returning tappable inline-keyboard results (no ID ever shown in visible text), callback routing (open/retry), app-managed command menu (no BotFather configuration needed).
 - `web/`: retheme (Slate & Sage palette, self-hosted Archivo + Inter), router, live SSE-backed ideas list, enrichment states, retry control, inline metadata correction with override protection.
 - Playwright end-to-end suite (`web/tests/capture.spec.js`) running against the built binary.
 
-**What does not exist yet:** everything past Milestone 1 (brief generation, recipe generation, export, script generation). The merge to `main` itself has not happened — see Log below.
+**Confirmed working in real use:** web capture, Telegram capture (text and voice), Claude metadata enrichment, Telegram commands and tappable search, correction with override protection.
+
+**What does not exist yet:** everything past Milestone 1 — brief generation, recipe generation, export, script generation.
 
 ---
 
@@ -36,7 +38,7 @@ Validated and carried forward: **rapid voice/text capture is the core value**, a
 
 | # | Scope | Status |
 |---|---|---|
-| 1 | Capture & organize: Go backend, SQLite, Claude inference, full ideas CRUD, retheme, Telegram text + voice capture and search | **Code-complete, verified, awaiting review & merge** |
+| 1 | Capture & organize: Go backend, SQLite, Claude inference, full ideas CRUD, retheme, Telegram text + voice capture and search | **Shipped** — merged, pushed, confirmed in real use |
 | 2 | Brief generation | Not started |
 | 3 | Recipe generation + structured review + revision chat | Not started |
 | 4 | Export (JSON, Markdown, Schema.org JSON-LD) | Not started |
