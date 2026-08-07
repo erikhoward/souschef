@@ -4830,9 +4830,1337 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
+## Task 11: Retheme — Slate & Sage, Archivo + Inter
+
+**Files:**
+- Create: `web/src/assets/fonts/` (four woff2 files), `web/src/styles/tokens.css`
+- Modify: `web/src/styles.css`, `web/src/main.jsx`
+- Delete: `web/src/assets/recipe-thumbnails.png`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: CSS custom properties on `:root` (`--bg`, `--surface`, `--border`, `--text`, `--muted`, `--accent`, `--accent-soft`, `--on-accent`, `--font-display`, `--font-ui`); `.food-thumbnail` restyled to a deterministic mark.
+
+- [ ] **Step 1: Vendor the fonts**
+
+A local-first app must not fall back to Helvetica when the network drops.
+Download the four weights we use and place them in `web/src/assets/fonts/`:
+
+```bash
+mkdir -p web/src/assets/fonts
+cd web/src/assets/fonts
+curl -fsSL -o inter-400.woff2 "https://cdn.jsdelivr.net/fontsource/fonts/inter@latest/latin-400-normal.woff2"
+curl -fsSL -o inter-500.woff2 "https://cdn.jsdelivr.net/fontsource/fonts/inter@latest/latin-500-normal.woff2"
+curl -fsSL -o inter-600.woff2 "https://cdn.jsdelivr.net/fontsource/fonts/inter@latest/latin-600-normal.woff2"
+curl -fsSL -o archivo-700.woff2 "https://cdn.jsdelivr.net/fontsource/fonts/archivo@latest/latin-700-normal.woff2"
+ls -la
+cd ../../../..
+```
+
+Verify each file is more than 10KB. If a URL 404s, fetch the equivalent from
+`https://fontsource.org/fonts/inter` and `https://fontsource.org/fonts/archivo`
+— the exact CDN path changes between releases, the fonts do not.
+
+- [ ] **Step 2: Write the token sheet**
+
+Create `web/src/styles/tokens.css`:
+
+```css
+/* Slate & Sage.
+ *
+ * The accent replaces the previous tomato red. It is not a new colour: the
+ * stylesheet already used greens (#516649, #5e8761, #4d6448) for recipe and
+ * review sections, so this promotes one that was already present.
+ *
+ * Status dots keep their own values and are always paired with a text label,
+ * because the accent sits nearer the status greens than a cooler accent would.
+ */
+
+@font-face {
+  font-family: 'Inter';
+  src: url('../assets/fonts/inter-400.woff2') format('woff2');
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('../assets/fonts/inter-500.woff2') format('woff2');
+  font-weight: 500; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('../assets/fonts/inter-600.woff2') format('woff2');
+  font-weight: 600; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'Archivo';
+  src: url('../assets/fonts/archivo-700.woff2') format('woff2');
+  font-weight: 700; font-style: normal; font-display: swap;
+}
+
+:root {
+  --bg: #f6f3ec;
+  --surface: #fcfaf5;
+  --surface-alt: #f4efe6;
+  --border: #dbd4c6;
+  --border-strong: #c6bda c;
+
+  --text: #24221d;
+  --muted: #736c62;
+  --faint: #8a8378;
+
+  --accent: #4f6b4a;
+  --accent-hover: #3f5a3b;
+  --accent-soft: #eaeee4;
+  --on-accent: #fbfdf8;
+
+  --danger: #8d3023;
+  --warn: #c98a2e;
+
+  --status-idea: #8a8378;
+  --status-brief: #c98a2e;
+  --status-recipe: #667f61;
+  --status-ready: #5e8761;
+  --status-archived: #a49c90;
+
+  --difficulty-easy: #619061;
+  --difficulty-moderate: #ce9935;
+  --difficulty-insane: #b04a2f;
+
+  --font-display: 'Archivo', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-ui: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  --radius: 6px;
+  --radius-sm: 4px;
+}
+```
+
+Note: `--border-strong` above contains a deliberate typo (`#c6bda c`) — fix it
+to `#c6bdac` when you paste it. If your editor does not flag it, the browser
+will silently ignore the declaration, which is exactly the kind of thing to
+catch now rather than wonder about later.
+
+- [ ] **Step 3: Apply the tokens across styles.css**
+
+Modify `web/src/styles.css`. Add the import at the very top:
+
+```css
+@import './styles/tokens.css';
+```
+
+Then replace every hardcoded colour with its token. The full mapping:
+
+| Old value | Replace with |
+|---|---|
+| `#f5f1e8`, `#f8f5ee` | `var(--bg)` |
+| `#fbfaf6`, `#fffefb`, `#fffdf8` | `var(--surface)` |
+| `#f4efe6`, `#f0ebe1`, `#eee8de` | `var(--surface-alt)` |
+| `#cfc7b8`, `#d7cfc1`, `#d8d0c2`, `#d1c9bb`, `#d2cabc`, `#d3ccbf` | `var(--border)` |
+| `#bfb6a7`, `#bbb1a1` | `var(--border-strong)` |
+| `#25231e`, `#28251f`, `#322f2a`, `#37332d`, `#36342f` | `var(--text)` |
+| `#716a5f`, `#736c62`, `#746d63`, `#777168`, `#5a554d`, `#514c44`, `#514d45` | `var(--muted)` |
+| `#80796f`, `#81786d`, `#847c71`, `#8b8378` | `var(--faint)` |
+| `#b73826`, `#b6432c`, `#c44836`, `#bc3826`, `#c53928` | `var(--accent)` |
+| `#a63020`, `#86281c`, `#852a1d` | `var(--accent-hover)` |
+| `#fffaf3` (on buttons) | `var(--on-accent)` |
+| `#8d3023` | `var(--danger)` |
+
+Then replace the three font declarations:
+
+```css
+/* was: font-family: Inter, ui-sans-serif, ... */
+:root { font-family: var(--font-ui); color: var(--text); background: var(--bg); }
+
+/* was: h1, h2, .brand { font-family: Georgia, "Times New Roman", serif; font-weight: 500; } */
+h1, h2, .brand {
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: -.04em;
+}
+
+/* was: .row-title-group strong { font-family: Georgia, ...; font-weight: 500; } */
+.row-title-group strong {
+  display: block;
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -.02em;
+}
+
+/* was: .section-title h3 { font-family: Georgia, ...; } */
+.section-title h3 { font-family: var(--font-display); font-size: 17px; font-weight: 600; }
+
+/* was: .ingredient-group h3 { font-family: Georgia, ...; font-style: italic; } */
+/* This rule belongs to RecipeWorkspace, which Task 12 deletes — remove it. */
+
+/* was: .recipe-description { font-family: Georgia, ...; } */
+/* Same — remove with RecipeWorkspace. */
+```
+
+- [ ] **Step 4: Replace the thumbnail with a deterministic mark**
+
+Delete the sprite sheet and its rule:
+
+```bash
+git rm web/src/assets/recipe-thumbnails.png
+```
+
+Replace the `.food-thumbnail` rule in `web/src/styles.css`:
+
+```css
+/* A deterministic mark derived from the primary ingredient. This is not a
+ * photograph and must not pretend to be one — real cover frames arrive in
+ * v1.5 when there is media to show. It preserves the row's visual rhythm
+ * and gives each idea a stable, recognisable identity in the list. */
+.food-thumbnail {
+  width: 64px;
+  height: 64px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: hsl(var(--thumb-hue, 40) 32% 72%);
+  color: hsl(var(--thumb-hue, 40) 45% 24%);
+  font-family: var(--font-display);
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1;
+  user-select: none;
+}
+```
+
+- [ ] **Step 5: Wire the token sheet into the entry point**
+
+`web/src/main.jsx` already imports `./styles.css`, which now imports the
+tokens. Confirm the import order — tokens must load first:
+
+```jsx
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+
+import './styles.css';
+import App from './App.jsx';
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>
+);
+```
+
+- [ ] **Step 6: Verify the build and check visually**
+
+```bash
+cd web && bun run build && bun run dev
+```
+
+Open http://localhost:5173. Confirm: no red anywhere; the sidebar, active tab,
+buttons, and "Next action" links are sage; headings and idea titles render in
+Archivo; metadata rows render in Inter. Then stop the dev server.
+
+Check for anything the mapping missed:
+
+```bash
+grep -nE '#(b7|b6|c4|bc|c5|a6|86|85)[0-9a-f]{4}' web/src/styles.css || echo "no red values remain"
+```
+
+Expected: `no red values remain`
+
+- [ ] **Step 7: Confirm fonts are self-hosted, not fetched**
+
+```bash
+grep -rn "fonts.googleapis\|fonts.gstatic\|cdn.jsdelivr" web/src/ web/index.html || echo "no remote font references"
+```
+
+Expected: `no remote font references`
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add -A
+git commit -m "feat(web): retheme to Slate & Sage with Archivo and Inter
+
+Colours move to custom properties on :root so the palette lives in one
+block. The sage accent is not a new colour — the stylesheet already used
+greens for recipe and review sections; this promotes one that was there
+and drops the red that was doing double duty as both 'primary button' and
+'insane difficulty'.
+
+Georgia was load-bearing: it separated editorial content from interface
+chrome. Archivo's display cut takes that role so a single sans does not
+flatten the hierarchy.
+
+Fonts are vendored as woff2. The sprite sheet of fake food photography is
+deleted and replaced with a deterministic mark.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 12: Router, API client, and live data
+
+**Files:**
+- Create: `web/src/lib/api.js`, `web/src/hooks/useIdeas.js`, `web/src/lib/thumbnail.js`
+- Modify: `web/src/App.jsx`, `web/src/main.jsx`, `web/src/components/IdeasWorkspace.jsx`, `web/vite.config.js`
+- Delete: `web/src/lib/pipeline.js`, `web/src/data/ideas.js`, `web/src/components/RecipeWorkspace.jsx`, `web/tests/pipeline.test.js`
+
+**Interfaces:**
+- Consumes: the REST API from Task 8, the SSE stream from Task 9.
+- Produces: `api.listIdeas(params)`, `api.createIdea(rawText)`, `api.patchIdea(id, patch)`, `api.archiveIdea(id)`, `api.restoreIdea(id)`, `api.deleteIdea(id)`, `api.reenrichIdea(id)`, `api.mergeIdeas(id, dupId)`, `api.linkIdeas(id, otherId)`, `api.addNote(id, body)`; `useIdeas(filters)` returning `{ideas, loading, error, connected, create, patch, archive, restore, remove, reenrich, merge, link, addNote}`; `thumbnailProps(idea)`.
+
+- [ ] **Step 1: Add the router and remove the mock data**
+
+```bash
+cd web
+bun add react-router
+bun remove --dev 2>/dev/null || true
+cd ..
+git rm web/src/lib/pipeline.js web/src/data/ideas.js web/src/components/RecipeWorkspace.jsx web/tests/pipeline.test.js
+```
+
+- [ ] **Step 2: Configure the dev proxy**
+
+Create or modify `web/vite.config.js`:
+
+```js
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 5173,
+    proxy: {
+      '/api': { target: 'http://127.0.0.1:8420', changeOrigin: true },
+      // SSE must not be buffered by the proxy.
+      '/events': { target: 'http://127.0.0.1:8420', changeOrigin: true, ws: false },
+    },
+  },
+});
+```
+
+- [ ] **Step 3: Write the API client**
+
+Create `web/src/lib/api.js`:
+
+```js
+// Thin wrappers over the REST surface. Every function throws an Error whose
+// message is the server's, so callers can surface it verbatim rather than
+// inventing their own copy.
+
+async function request(path, { method = 'GET', body } = {}) {
+  const response = await fetch(path, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  if (response.status === 204) return null;
+
+  const text = await response.text();
+  let payload = null;
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      throw new Error(`Unexpected response from ${path}: ${text.slice(0, 200)}`);
+    }
+  }
+
+  if (!response.ok) {
+    throw new Error(payload?.error ?? `${response.status} ${response.statusText}`);
+  }
+  return payload;
+}
+
+export function listIdeas(params = {}) {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== '' && value != null && value !== 'all') query.set(key, value);
+  }
+  // `archived` is meaningful as the literal string "all", so set it explicitly.
+  if (params.archived) query.set('archived', params.archived);
+
+  const qs = query.toString();
+  return request(`/api/ideas${qs ? `?${qs}` : ''}`);
+}
+
+export const createIdea = (rawText) =>
+  request('/api/ideas', { method: 'POST', body: { raw_text: rawText, source: 'web' } });
+
+export const patchIdea = (id, patch) =>
+  request(`/api/ideas/${id}`, { method: 'PATCH', body: patch });
+
+export const archiveIdea = (id) => request(`/api/ideas/${id}/archive`, { method: 'POST' });
+export const restoreIdea = (id) => request(`/api/ideas/${id}/restore`, { method: 'POST' });
+export const reenrichIdea = (id) => request(`/api/ideas/${id}/reenrich`, { method: 'POST' });
+export const deleteIdea = (id) => request(`/api/ideas/${id}`, { method: 'DELETE' });
+
+export const addNote = (id, body) =>
+  request(`/api/ideas/${id}/notes`, { method: 'POST', body: { body } });
+
+export const linkIdeas = (id, otherId) =>
+  request(`/api/ideas/${id}/links`, { method: 'POST', body: { other_id: otherId } });
+
+export const mergeIdeas = (id, duplicateId) =>
+  request(`/api/ideas/${id}/merge`, { method: 'POST', body: { duplicate_id: duplicateId } });
+```
+
+- [ ] **Step 4: Write the deterministic thumbnail helper**
+
+Create `web/src/lib/thumbnail.js`:
+
+```js
+// A stable mark per idea: a letter from the primary ingredient over a hue
+// hashed from the same value. Deterministic, so an idea keeps its identity in
+// the list across reloads.
+
+function hashHue(input) {
+  let hash = 0;
+  for (let i = 0; i < input.length; i += 1) {
+    hash = (hash * 31 + input.charCodeAt(i)) % 360;
+  }
+  return hash;
+}
+
+export function thumbnailProps(idea) {
+  const seed = idea.metadata?.primary_ingredient || idea.title || idea.id;
+  const letter = seed.trim().charAt(0).toUpperCase() || '·';
+  return {
+    letter,
+    style: { '--thumb-hue': hashHue(seed) },
+    label: idea.metadata?.primary_ingredient
+      ? `Primary ingredient: ${idea.metadata.primary_ingredient}`
+      : 'No primary ingredient inferred yet',
+  };
+}
+```
+
+- [ ] **Step 5: Write the data hook**
+
+Create `web/src/hooks/useIdeas.js`:
+
+```js
+import { useCallback, useEffect, useRef, useState } from 'react';
+
+import * as api from '../lib/api.js';
+
+/**
+ * Owns the idea list: initial fetch, mutations, and live updates over SSE.
+ *
+ * This replaces the fifteen-prop drill through App.jsx. Components read what
+ * they need from the returned object instead of having it threaded down.
+ */
+export function useIdeas(filters) {
+  const [ideas, setIdeas] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [connected, setConnected] = useState(false);
+
+  // Keep the latest filters in a ref so the SSE effect does not resubscribe
+  // on every keystroke in the search box.
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
+
+  const refresh = useCallback(async () => {
+    try {
+      setError(null);
+      const rows = await api.listIdeas(filtersRef.current);
+      setIdeas(rows);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    setLoading(true);
+    refresh();
+  }, [refresh, filters.q, filters.stage, filters.difficulty,
+      filters.duration, filters.treatment, filters.archived,
+      filters.sort, filters.order]);
+
+  // Live updates. EventSource reconnects on its own using the server's
+  // `retry` hint, so there is no manual backoff here — but a reconnect can
+  // miss events, so we refetch when the connection is re-established.
+  useEffect(() => {
+    const source = new EventSource('/events');
+    let hasConnected = false;
+
+    source.onopen = () => {
+      setConnected(true);
+      if (hasConnected) refresh(); // resynchronise after a gap
+      hasConnected = true;
+    };
+
+    source.onerror = () => setConnected(false);
+
+    source.onmessage = (event) => {
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      setIdeas((current) => {
+        if (payload.type === 'idea.deleted') {
+          return current.filter((idea) => idea.id !== payload.id);
+        }
+        if (!payload.idea) return current;
+
+        const index = current.findIndex((idea) => idea.id === payload.idea.id);
+        if (index === -1) {
+          return payload.type === 'idea.created' ? [payload.idea, ...current] : current;
+        }
+        const next = current.slice();
+        next[index] = payload.idea;
+        return next;
+      });
+    };
+
+    return () => source.close();
+  }, [refresh]);
+
+  const create = useCallback(async (rawText) => {
+    // The server broadcasts idea.created, but inserting here too means the
+    // row appears even if the SSE stream is momentarily down.
+    const idea = await api.createIdea(rawText);
+    setIdeas((current) =>
+      current.some((i) => i.id === idea.id) ? current : [idea, ...current]);
+    return idea;
+  }, []);
+
+  const replace = useCallback((updated) => {
+    setIdeas((current) => current.map((i) => (i.id === updated.id ? updated : i)));
+    return updated;
+  }, []);
+
+  const patch    = useCallback(async (id, p)     => replace(await api.patchIdea(id, p)), [replace]);
+  const archive  = useCallback(async (id)        => replace(await api.archiveIdea(id)), [replace]);
+  const restore  = useCallback(async (id)        => replace(await api.restoreIdea(id)), [replace]);
+  const reenrich = useCallback(async (id)        => replace(await api.reenrichIdea(id)), [replace]);
+  const link     = useCallback(async (id, other) => replace(await api.linkIdeas(id, other)), [replace]);
+  const addNote  = useCallback(async (id, body)  => replace(await api.addNote(id, body)), [replace]);
+  const merge    = useCallback(async (id, dup)   => {
+    const merged = await api.mergeIdeas(id, dup);
+    setIdeas((current) =>
+      current.filter((i) => i.id !== dup).map((i) => (i.id === merged.id ? merged : i)));
+    return merged;
+  }, []);
+
+  const remove = useCallback(async (id) => {
+    await api.deleteIdea(id);
+    setIdeas((current) => current.filter((i) => i.id !== id));
+  }, []);
+
+  return {
+    ideas, loading, error, connected, refresh,
+    create, patch, archive, restore, remove, reenrich, merge, link, addNote,
+  };
+}
+```
+
+- [ ] **Step 6: Rewrite App.jsx**
+
+Replace `web/src/App.jsx`:
+
+```jsx
+import { useEffect, useRef, useState } from 'react';
+import { Route, Routes, useNavigate, useParams } from 'react-router';
+
+import { IdeasWorkspace } from './components/IdeasWorkspace.jsx';
+import { Sidebar } from './components/Sidebar.jsx';
+import { useIdeas } from './hooks/useIdeas.js';
+
+const emptyFilters = {
+  q: '', stage: '', difficulty: '', duration: '',
+  treatment: '', archived: '', sort: 'created_at', order: 'desc',
+};
+
+function Workspace() {
+  const { id: selectedId } = useParams();
+  const navigate = useNavigate();
+
+  const [filters, setFilters] = useState(emptyFilters);
+  const [captureValue, setCaptureValue] = useState('');
+  const [toast, setToast] = useState('');
+  const toastTimer = useRef(null);
+
+  const store = useIdeas(filters);
+
+  const announce = (message) => {
+    window.clearTimeout(toastTimer.current);
+    setToast(message);
+    toastTimer.current = window.setTimeout(() => setToast(''), 3200);
+  };
+
+  useEffect(() => () => window.clearTimeout(toastTimer.current), []);
+
+  const guard = (fn, success) => async (...args) => {
+    try {
+      const result = await fn(...args);
+      if (success) announce(success);
+      return result;
+    } catch (err) {
+      announce(err.message);
+      return null;
+    }
+  };
+
+  const handleCreate = async (event) => {
+    event.preventDefault();
+    const text = captureValue.trim();
+    if (!text) return;
+    const idea = await guard(store.create)(text);
+    if (idea) {
+      setCaptureValue('');
+      navigate(`/ideas/${idea.id}`);
+      announce('Saved. Reading it now…');
+    }
+  };
+
+  const focusCapture = () => {
+    window.setTimeout(() => document.querySelector('.capture-control textarea')?.focus(), 0);
+  };
+
+  return (
+    <div className="app-shell">
+      <Sidebar activeView="ideas" onNavigate={() => {}} onCapture={focusCapture} />
+      <IdeasWorkspace
+        store={store}
+        filters={filters}
+        onFiltersChange={(patch) => setFilters((current) => ({ ...current, ...patch }))}
+        selectedId={selectedId}
+        onSelect={(id) => navigate(id ? `/ideas/${id}` : '/ideas')}
+        captureValue={captureValue}
+        onCaptureChange={setCaptureValue}
+        onCreate={handleCreate}
+        onCaptureFocus={focusCapture}
+        announce={announce}
+        guard={guard}
+      />
+      {toast && <div className="toast" role="status">{toast}</div>}
+      {!store.connected && (
+        <div className="connection-warning" role="status">
+          Live updates disconnected — reconnecting…
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<Workspace />} />
+      <Route path="/ideas" element={<Workspace />} />
+      <Route path="/ideas/:id" element={<Workspace />} />
+    </Routes>
+  );
+}
+```
+
+- [ ] **Step 7: Add the router provider**
+
+Modify `web/src/main.jsx`:
+
+```jsx
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import { BrowserRouter } from 'react-router';
+
+import './styles.css';
+import App from './App.jsx';
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </StrictMode>
+);
+```
+
+- [ ] **Step 8: Add the connection-warning style**
+
+Append to `web/src/styles.css`:
+
+```css
+.connection-warning {
+  position: fixed;
+  z-index: 11;
+  bottom: 22px;
+  left: 24px;
+  padding: 9px 13px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+}
+```
+
+- [ ] **Step 9: Rewire IdeasWorkspace to the store**
+
+Modify `web/src/components/IdeasWorkspace.jsx`. Three changes; the markup and
+class names are otherwise unchanged.
+
+Replace the imports and the deleted constants at the top:
+
+```jsx
+import { useState } from 'react';
+
+import { thumbnailProps } from '../lib/thumbnail.js';
+import { Icon } from './Icon.jsx';
+
+const STATUS_LABELS = {
+  idea: 'Backlog',
+  brief_ready: 'Brief ready',
+  recipe_review: 'In recipe review',
+  script_ready: 'Script ready',
+  production_ready: 'Ready to produce',
+};
+
+const PIPELINE_STEPS = [
+  ['idea', 'Idea'],
+  ['brief_ready', 'Brief'],
+  ['recipe_review', 'Recipe'],
+  ['script_ready', 'Script'],
+  ['production_ready', 'Produce'],
+];
+
+const filters = [
+  ['', 'All'],
+  ['idea', 'Backlog'],
+  ['brief_ready', 'Brief'],
+  ['recipe_review', 'Recipe'],
+  ['script_ready', 'Script'],
+];
+
+const labelize = (value) => (value ? value.replaceAll('_', ' ') : '—');
+```
+
+Replace `FoodThumbnail`:
+
+```jsx
+function FoodThumbnail({ idea }) {
+  const { letter, style, label } = thumbnailProps(idea);
+  return (
+    <span className="food-thumbnail" style={style} role="img" aria-label={label}>
+      {letter}
+    </span>
+  );
+}
+```
+
+Replace the `IdeasWorkspace` export signature and body — filtering now happens
+on the server:
+
+```jsx
+export function IdeasWorkspace({
+  store, filters: active, onFiltersChange, selectedId, onSelect,
+  captureValue, onCaptureChange, onCreate, onCaptureFocus, announce, guard,
+}) {
+  const { ideas, loading, error } = store;
+  const selectedIdea = ideas.find((idea) => idea.id === selectedId) ?? null;
+
+  return (
+    <main className="workspace ideas-workspace">
+      <header className="workspace-header">
+        <h1>Ideas</h1>
+        <label className="search-box">
+          <Icon name="search" size={21} />
+          <input
+            type="search"
+            value={active.q}
+            onChange={(event) => onFiltersChange({ q: event.target.value })}
+            placeholder="Search ideas"
+            aria-label="Search ideas"
+          />
+          <kbd>⌘ K</kbd>
+        </label>
+        <button className="button button-primary header-capture" type="button" onClick={onCaptureFocus}>
+          <Icon name="plus" size={18} />Capture idea
+        </button>
+      </header>
+
+      <div className="ideas-layout">
+        <section className="ideas-main">
+          <CaptureComposer
+            captureValue={captureValue}
+            onCaptureChange={onCaptureChange}
+            onCapture={onCreate}
+            onFocus={onCaptureFocus}
+          />
+          <FilterBar active={active} onChange={onFiltersChange} />
+
+          <section className="idea-list" aria-label="Idea backlog">
+            <div className="idea-list-heading">
+              <span>Title</span><span /><span>Meta</span>
+              <span>Content type</span><span>Status</span><span>Next action</span>
+            </div>
+
+            {error && <div className="empty-list" role="alert">{error}</div>}
+            {loading && !ideas.length && <div className="empty-list">Loading…</div>}
+
+            {ideas.map((idea) => (
+              <IdeaRow
+                key={idea.id}
+                idea={idea}
+                isSelected={idea.id === selectedId}
+                onSelect={onSelect}
+                onRetry={guard(store.reenrich, 'Retrying enrichment…')}
+              />
+            ))}
+
+            {!loading && !ideas.length && !error && (
+              <div className="empty-list">
+                <Icon name="search" size={28} />
+                {active.q ? 'No ideas match that search.' : 'Nothing captured yet.'}
+              </div>
+            )}
+            <footer>{ideas.length} idea{ideas.length === 1 ? '' : 's'}</footer>
+          </section>
+        </section>
+
+        {selectedIdea && (
+          <IdeaInspector
+            idea={selectedIdea}
+            allIdeas={ideas}
+            store={store}
+            guard={guard}
+            announce={announce}
+            onSelect={onSelect}
+            onClose={() => onSelect(null)}
+          />
+        )}
+      </div>
+    </main>
+  );
+}
+```
+
+Replace `FilterBar` so it drives the server-side filters:
+
+```jsx
+function FilterBar({ active, onChange }) {
+  return (
+    <div className="filter-bar">
+      <div className="filter-tabs" role="tablist" aria-label="Idea stage">
+        {filters.map(([id, label]) => (
+          <button
+            key={id || 'all'}
+            type="button"
+            className={active.stage === id ? 'is-active' : ''}
+            onClick={() => onChange({ stage: id })}
+          >
+            {label}
+          </button>
+        ))}
+        <button
+          type="button"
+          className={active.archived === 'true' ? 'is-active' : ''}
+          onClick={() => onChange({ archived: active.archived === 'true' ? '' : 'true' })}
+        >
+          Archived
+        </button>
+      </div>
+      <div className="filter-selects">
+        <select value={active.difficulty} onChange={(e) => onChange({ difficulty: e.target.value })}
+                aria-label="Filter by difficulty">
+          <option value="">Difficulty</option>
+          <option value="easy">Easy</option>
+          <option value="moderate">Moderate</option>
+          <option value="insane">Insane</option>
+        </select>
+        <select value={active.duration} onChange={(e) => onChange({ duration: e.target.value })}
+                aria-label="Filter by duration">
+          <option value="">Duration</option>
+          <option value="quick">Quick</option>
+          <option value="average">Average</option>
+          <option value="multi_day">Multi-day</option>
+        </select>
+        <select value={active.treatment} onChange={(e) => onChange({ treatment: e.target.value })}
+                aria-label="Filter by treatment">
+          <option value="">Treatment</option>
+          <option value="elevated">Elevated</option>
+          <option value="non_elevated">Non-elevated</option>
+        </select>
+        <select value={active.sort} onChange={(e) => onChange({ sort: e.target.value })}
+                aria-label="Sort by">
+          <option value="created_at">Newest</option>
+          <option value="updated_at">Recently updated</option>
+          <option value="title">Title</option>
+          <option value="difficulty">Difficulty</option>
+          <option value="duration">Duration</option>
+        </select>
+        <Icon name="sliders" size={20} />
+      </div>
+    </div>
+  );
+}
+```
+
+`IdeaRow` and `IdeaInspector` are finished in Task 13.
+
+- [ ] **Step 10: Verify against the real backend**
+
+```bash
+make build && ./bin/souschef &
+sleep 1
+cd web && bun run dev
+```
+
+Open http://localhost:5173, type an idea, press Save. Confirm the row appears
+immediately, and that navigating to `/ideas/<id>` directly still loads. Then
+stop both.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add -A
+git commit -m "feat(web): router, API client, and live data over SSE
+
+Replaces useState-over-seed-fixtures with a useIdeas hook owning fetch,
+mutation, and the event stream. Filtering and sorting move to the server,
+so the list reflects the database rather than a client-side subset.
+
+EventSource reconnects on its own, but a reconnect can miss events — so
+the hook refetches when the stream comes back rather than trusting that
+it saw everything.
+
+Deletes pipeline.js, data/ideas.js, RecipeWorkspace.jsx and
+pipeline.test.js. RecipeWorkspace returns in a later milestone built
+against a real schema instead of being kept alive as a mock.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 13: Enrichment states and metadata correction
+
+**Files:**
+- Modify: `web/src/components/IdeasWorkspace.jsx`, `web/src/styles.css`
+
+**Interfaces:**
+- Consumes: `store` from Task 12.
+- Produces: `IdeaRow` and `IdeaInspector` handling pending/failed states and inline correction.
+
+- [ ] **Step 1: Write IdeaRow with enrichment states**
+
+Replace `IdeaRow` in `web/src/components/IdeasWorkspace.jsx`:
+
+```jsx
+const DURATION_LABELS = { quick: 'Quick', average: 'Average', multi_day: 'Multi-day' };
+
+function MetaIcon({ icon, children, tone = '' }) {
+  return (
+    <span className={`meta-value ${tone}`}>
+      <Icon name={icon} size={14} />{children}
+    </span>
+  );
+}
+
+function IdeaRow({ idea, isSelected, onSelect, onRetry }) {
+  const { status, error } = idea.enrichment;
+  const meta = idea.metadata;
+
+  return (
+    <div
+      className={`idea-row ${isSelected ? 'is-selected' : ''} ${status === 'failed' ? 'is-failed' : ''}`}
+      role="button"
+      tabIndex={0}
+      onClick={() => onSelect(idea.id)}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onSelect(idea.id);
+        }
+      }}
+    >
+      <span className="row-title-group">
+        <span className="selection-mark">
+          <Icon name={isSelected ? 'check' : 'lightbulb'} size={15} />
+        </span>
+        <span>
+          <strong>{idea.title}</strong>
+          <small>{idea.raw_text}</small>
+        </span>
+      </span>
+
+      <FoodThumbnail idea={idea} />
+
+      <span className="row-meta">
+        {status === 'pending' && <span className="meta-pending">Reading…</span>}
+
+        {status === 'failed' && (
+          <span className="meta-failed">
+            <Icon name="x" size={13} />
+            <span className="meta-failed-text" title={error}>{error}</span>
+            <button
+              type="button"
+              className="text-button"
+              onClick={(event) => { event.stopPropagation(); onRetry(idea.id); }}
+            >
+              Retry
+            </button>
+          </span>
+        )}
+
+        {status === 'ok' && (
+          <>
+            <MetaIcon icon="lightbulb" tone={meta.difficulty}>{labelize(meta.difficulty)}</MetaIcon>
+            <MetaIcon icon="clock">{DURATION_LABELS[meta.duration_class] ?? '—'}</MetaIcon>
+            <MetaIcon icon="leaf">{labelize(meta.treatment)}</MetaIcon>
+            {meta.cuisine && <MetaIcon icon="globe">{meta.cuisine}</MetaIcon>}
+            {meta.primary_ingredient && <MetaIcon icon="egg">{meta.primary_ingredient}</MetaIcon>}
+          </>
+        )}
+      </span>
+
+      <span className="content-type">
+        <Icon name={meta.content_type === 'vlog' ? 'video' : 'book'} size={19} />
+        {meta.content_type === 'vlog' ? 'Vlog' : 'Recipe'}
+      </span>
+
+      <span className="status-cell">
+        <i className={`status-dot ${idea.archived_at ? 'archived' : idea.stage}`} />
+        {idea.archived_at ? 'Archived' : STATUS_LABELS[idea.stage]}
+        <small>{new Date(idea.updated_at).toLocaleString()}</small>
+      </span>
+
+      <span className="row-action">
+        Open<Icon name="arrow" size={18} />
+      </span>
+    </div>
+  );
+}
+```
+
+Note the element changed from `<button>` to a `<div role="button">`. The
+original nested a Retry button inside an outer `<button>`, which is invalid
+HTML and makes the inner control unreachable by keyboard in some browsers.
+
+- [ ] **Step 2: Write the correction UI**
+
+Replace `IdeaInspector` in `web/src/components/IdeasWorkspace.jsx`:
+
+```jsx
+const FIELD_OPTIONS = {
+  difficulty: ['easy', 'moderate', 'insane'],
+  duration_class: ['quick', 'average', 'multi_day'],
+  treatment: ['elevated', 'non_elevated'],
+  content_type: ['recipe', 'vlog'],
+  visual_potential: ['low', 'medium', 'high'],
+  seasonality: ['spring', 'summer', 'fall', 'winter', 'all_year'],
+  production_effort: ['light', 'average', 'heavy'],
+};
+
+const FIELD_LABELS = {
+  difficulty: 'Difficulty',
+  duration_class: 'Duration',
+  treatment: 'Treatment',
+  content_type: 'Content type',
+  cuisine: 'Cuisine',
+  primary_ingredient: 'Primary ingredient',
+  visual_potential: 'Visual potential',
+  seasonality: 'Seasonality',
+  production_effort: 'Production effort',
+};
+
+// A corrected field is marked so it is obvious which values are yours and
+// which the model's — and so the protection from re-enrichment is visible
+// rather than an invisible rule.
+function CorrectableField({ idea, field, onCorrect }) {
+  const options = FIELD_OPTIONS[field];
+  const value = idea.metadata[field] ?? '';
+  const overridden = idea.field_overrides.includes(field);
+
+  return (
+    <div>
+      <dt>
+        {FIELD_LABELS[field]}
+        {overridden && <span className="override-mark" title="You set this. Re-enrichment will not change it.">✎</span>}
+      </dt>
+      <dd>
+        {options ? (
+          <select value={value} onChange={(event) => onCorrect(field, event.target.value)}
+                  aria-label={FIELD_LABELS[field]}>
+            <option value="">—</option>
+            {options.map((option) => (
+              <option key={option} value={option}>{labelize(option)}</option>
+            ))}
+          </select>
+        ) : (
+          <input
+            type="text"
+            defaultValue={value}
+            aria-label={FIELD_LABELS[field]}
+            onBlur={(event) => {
+              if (event.target.value !== value) onCorrect(field, event.target.value);
+            }}
+          />
+        )}
+      </dd>
+    </div>
+  );
+}
+
+function PipelineStepper({ status }) {
+  const index = Math.max(0, PIPELINE_STEPS.findIndex(([id]) => id === status));
+  return (
+    <ol className="pipeline-stepper" aria-label="Idea workflow stage">
+      {PIPELINE_STEPS.map(([id, label], step) => (
+        <li key={id} className={step <= index ? 'is-complete' : ''}>
+          <span className={step === index ? 'is-current' : ''} />
+          <small>{label}</small>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function IdeaInspector({ idea, allIdeas, store, guard, announce, onSelect, onClose }) {
+  const [noteDraft, setNoteDraft] = useState('');
+  const [linkTarget, setLinkTarget] = useState('');
+  const [mergeTarget, setMergeTarget] = useState('');
+
+  const correct = guard(
+    (field, value) => store.patch(idea.id, { [field]: value }),
+    'Saved. Re-enrichment will leave that field alone.'
+  );
+
+  const candidates = allIdeas.filter(
+    (other) => other.id !== idea.id && !idea.linked_ids.includes(other.id));
+
+  return (
+    <aside className="inspector" aria-label={`${idea.title} details`}>
+      <button className="icon-button inspector-close" type="button" onClick={onClose}
+              aria-label="Close details">
+        <Icon name="x" size={20} />
+      </button>
+
+      <h2>{idea.title}</h2>
+      <PipelineStepper status={idea.stage} />
+
+      {idea.enrichment.status === 'failed' && (
+        <div className="inspector-alert" role="alert">
+          <strong>Enrichment failed</strong>
+          <p>{idea.enrichment.error}</p>
+          <button className="button button-outline" type="button"
+                  onClick={() => guard(store.reenrich, 'Retrying…')(idea.id)}>
+            Retry
+          </button>
+        </div>
+      )}
+
+      <section className="inspector-section metadata-section">
+        <div className="section-title"><h3>Metadata</h3></div>
+        <dl className="metadata-list">
+          {Object.keys(FIELD_LABELS).map((field) => (
+            <CorrectableField key={field} idea={idea} field={field} onCorrect={correct} />
+          ))}
+        </dl>
+      </section>
+
+      <section className="inspector-section">
+        <div className="section-title"><h3>Original capture</h3></div>
+        <p className="muted-copy raw-text">{idea.raw_text}</p>
+      </section>
+
+      <section className="inspector-section">
+        <div className="section-title"><h3>Notes</h3></div>
+        {idea.notes.length > 0 && (
+          <ul className="note-list">
+            {idea.notes.map((note) => <li key={note.id}>{note.body}</li>)}
+          </ul>
+        )}
+        <form
+          className="link-control"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            if (!noteDraft.trim()) return;
+            if (await guard(store.addNote, 'Note added.')(idea.id, noteDraft)) setNoteDraft('');
+          }}
+        >
+          <input type="text" value={noteDraft} placeholder="Add a note…"
+                 aria-label="New note" onChange={(event) => setNoteDraft(event.target.value)} />
+          <button className="text-button" type="submit" disabled={!noteDraft.trim()}>Add</button>
+        </form>
+      </section>
+
+      <section className="inspector-section">
+        <div className="section-title"><h3>Related ideas</h3></div>
+        {idea.linked_ids.length === 0 ? (
+          <p className="muted-copy">No linked ideas yet.</p>
+        ) : (
+          <div className="related-list">
+            {idea.linked_ids.map((id) => {
+              const other = allIdeas.find((i) => i.id === id);
+              return (
+                <button key={id} type="button" onClick={() => onSelect(id)}>
+                  <span>{other ? other.title : id}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+        {candidates.length > 0 && (
+          <div className="link-control">
+            <select value={linkTarget} onChange={(event) => setLinkTarget(event.target.value)}
+                    aria-label="Link another idea">
+              <option value="">Link another idea…</option>
+              {candidates.map((c) => <option key={c.id} value={c.id}>{c.title}</option>)}
+            </select>
+            <button className="text-button" type="button" disabled={!linkTarget}
+                    onClick={async () => {
+                      if (await guard(store.link, 'Linked.')(idea.id, linkTarget)) setLinkTarget('');
+                    }}>
+              Link
+            </button>
+          </div>
+        )}
+      </section>
+
+      <div className="inspector-actions">
+        {candidates.length > 0 && (
+          <div className="link-control">
+            <select value={mergeTarget} onChange={(event) => setMergeTarget(event.target.value)}
+                    aria-label="Merge a duplicate into this idea">
+              <option value="">Merge a duplicate in…</option>
+              {candidates.map((c) => <option key={c.id} value={c.id}>{c.title}</option>)}
+            </select>
+            <button className="text-button" type="button" disabled={!mergeTarget}
+                    onClick={async () => {
+                      if (await guard(store.merge, 'Merged.')(idea.id, mergeTarget)) setMergeTarget('');
+                    }}>
+              Merge
+            </button>
+          </div>
+        )}
+
+        <div className="secondary-actions">
+          <button type="button" className="text-button"
+                  onClick={() => guard(idea.archived_at ? store.restore : store.archive,
+                                       idea.archived_at ? 'Restored.' : 'Archived.')(idea.id)}>
+            <Icon name={idea.archived_at ? 'arrow' : 'archive'} size={15} />
+            {idea.archived_at ? 'Restore' : 'Archive'}
+          </button>
+          <button type="button" className="text-button delete-button"
+                  onClick={() => {
+                    if (window.confirm(`Delete “${idea.title}”? This cannot be undone.`)) {
+                      guard(store.remove, 'Deleted.')(idea.id);
+                      onClose();
+                    }
+                  }}>
+            <Icon name="trash" size={15} />Delete
+          </button>
+        </div>
+      </div>
+    </aside>
+  );
+}
+```
+
+- [ ] **Step 3: Add the styles for the new states**
+
+Append to `web/src/styles.css`:
+
+```css
+.meta-pending { color: var(--faint); font-size: 11px; font-style: italic; }
+
+.meta-failed {
+  display: flex; align-items: center; gap: 6px;
+  color: var(--danger); font-size: 11px;
+}
+.meta-failed-text {
+  display: block; max-width: 190px;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.idea-row.is-failed { background: color-mix(in srgb, var(--danger) 4%, transparent); }
+
+.inspector-alert {
+  margin: 16px 0; padding: 13px;
+  border: 1px solid var(--danger); border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--danger) 6%, var(--surface));
+}
+.inspector-alert strong { display: block; color: var(--danger); font-size: 12px; }
+.inspector-alert p {
+  margin: 6px 0 11px;
+  color: var(--muted); font-size: 11px; line-height: 1.4;
+  word-break: break-word;
+}
+
+.override-mark { margin-left: 5px; color: var(--accent); font-size: 11px; }
+
+.metadata-list select,
+.metadata-list input[type='text'] {
+  width: 100%; height: 28px; padding: 0 7px;
+  border: 1px solid var(--border); border-radius: 3px;
+  background: var(--surface); color: var(--text); font-size: 11px;
+}
+
+.note-list { margin: 11px 0 0; padding-left: 17px; }
+.note-list li { margin-bottom: 6px; color: var(--muted); font-size: 11px; line-height: 1.4; }
+
+.raw-text { white-space: pre-wrap; }
+
+.idea-row { cursor: pointer; }
+.idea-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+```
+
+- [ ] **Step 4: Verify by hand against a failing key**
+
+```bash
+make build
+env ANTHROPIC_API_KEY=sk-ant-definitely-invalid ./bin/souschef &
+sleep 1
+cd web && bun run dev
+```
+
+Capture an idea. Confirm: it appears instantly, shows "Reading…", then within
+seconds flips to a red row showing a `401` message with a working Retry
+button. **This is the acceptance test for done-definition item 8** — if the
+row spins forever or shows nothing, stop and fix it before continuing.
+
+Then stop both processes.
+
+- [ ] **Step 5: Verify the happy path**
+
+Repeat with a valid credential. Confirm metadata chips fill in without a
+refresh, and that changing a dropdown shows the ✎ mark and survives a Retry.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add -A
+git commit -m "feat(web): enrichment states and inline metadata correction
+
+Pending shows a placeholder; failed shows the provider's message on the
+row with a working Retry, and marks the row so it is visible in a long
+list. This is the fix for the failure mode where a dead key looked
+identical to slow work.
+
+Corrected fields carry a ✎ mark, so which values are yours and which the
+model's is visible rather than an invisible rule about re-enrichment.
+
+IdeaRow becomes a div[role=button]: the original nested a Retry button
+inside an outer button, which is invalid HTML and left the inner control
+unreachable by keyboard in some browsers.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
 ## Remaining tasks
 
-Tasks 11–17 follow the same structure. Deliverables:
+Tasks 14–17 follow the same structure. Deliverables:
 
 | Task | Deliverable |
 |---|---|
