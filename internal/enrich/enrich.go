@@ -112,32 +112,31 @@ type Failure struct {
 	Retryable bool
 }
 
-// statusCarrier is satisfied by the SDK's error type and by the test stub.
-type statusCarrier interface {
-	Error() string
-	StatusCode() int
-}
-
-type requestIDCarrier interface{ RequestID() string }
-
 // Classify turns any error into a message for the idea row and a retry
 // decision. Nothing is swallowed: a transport failure with no status still
 // produces text a human can act on.
+//
+// It matches the SDK's concrete *anthropic.Error type directly rather than
+// through a duck-typed interface: StatusCode and RequestID are struct
+// FIELDS on that type, not methods, so an interface requiring StatusCode()
+// and RequestID() as methods never matches a real API error and every
+// classification below would silently become dead code.
 func Classify(err error) Failure {
 	if err == nil {
 		return Failure{}
 	}
 
-	var sc statusCarrier
-	if errors.As(err, &sc) {
-		msg := fmt.Sprintf("%d %s", sc.StatusCode(), sc.Error())
-
-		var rc requestIDCarrier
-		if errors.As(err, &rc) && rc.RequestID() != "" {
-			msg += fmt.Sprintf(" (request_id=%s)", rc.RequestID())
+	var apierr *anthropic.Error
+	if errors.As(err, &apierr) {
+		// apierr.Error() already folds in the request ID when present; the
+		// status code is prefixed again so the row is grep-able by code
+		// without parsing the full message.
+		msg := fmt.Sprintf("%d %s", apierr.StatusCode, apierr.Error())
+		if apierr.RequestID != "" && !strings.Contains(msg, apierr.RequestID) {
+			msg += fmt.Sprintf(" (request_id=%s)", apierr.RequestID)
 		}
 
-		switch code := sc.StatusCode(); {
+		switch code := apierr.StatusCode; {
 		case code == 401 || code == 403:
 			// The key is wrong or unauthorized. Retrying cannot help, and
 			// retrying quietly is how this became invisible last time.

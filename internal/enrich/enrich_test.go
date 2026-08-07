@@ -3,11 +3,30 @@ package enrich
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/anthropics/anthropic-sdk-go"
 )
+
+// newAPIError builds a real *anthropic.Error the way the SDK does: StatusCode
+// and RequestID are struct fields, not methods. (*anthropic.Error).Error()
+// dereferences Request and Response to build its message, so both must be
+// populated with minimal real values or Error() panics.
+func newAPIError(status int, requestID string) *anthropic.Error {
+	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	resp := &http.Response{StatusCode: status}
+	return &anthropic.Error{
+		StatusCode: status,
+		Request:    req,
+		Response:   resp,
+		RequestID:  requestID,
+	}
+}
 
 func fixture(t *testing.T, name string) []byte {
 	t.Helper()
@@ -78,13 +97,30 @@ func TestParseResponseRejectsEmptyTitle(t *testing.T) {
 	}
 }
 
+// TestClassifyRealAPIError401NotRetryable exercises the concrete SDK error
+// type end to end, not a hand-shaped stub. StatusCode and RequestID are
+// fields on *anthropic.Error, not methods — a duck-typed interface expecting
+// methods never matches, so this must use the real type or it proves nothing.
+func TestClassifyRealAPIError401NotRetryable(t *testing.T) {
+	got := Classify(newAPIError(401, "req_real_123"))
+
+	if got.Retryable {
+		t.Error("a real SDK 401 must not be retried — the key will not fix itself")
+	}
+	for _, want := range []string{"401", "req_real_123"} {
+		if !strings.Contains(got.Message, want) {
+			t.Errorf("message %q should contain %q", got.Message, want)
+		}
+	}
+}
+
 func TestClassifyAuthFailureIsNotRetryable(t *testing.T) {
-	got := Classify(&stubAPIError{status: 401, msg: "invalid x-api-key", requestID: "req_abc"})
+	got := Classify(newAPIError(401, "req_abc"))
 
 	if got.Retryable {
 		t.Error("a 401 must not be retried — the key will not fix itself")
 	}
-	for _, want := range []string{"401", "invalid x-api-key", "req_abc"} {
+	for _, want := range []string{"401", "req_abc"} {
 		if !strings.Contains(got.Message, want) {
 			t.Errorf("message %q should contain %q", got.Message, want)
 		}
@@ -92,7 +128,7 @@ func TestClassifyAuthFailureIsNotRetryable(t *testing.T) {
 }
 
 func TestClassifyRateLimitIsRetryable(t *testing.T) {
-	got := Classify(&stubAPIError{status: 429, msg: "rate_limit_error"})
+	got := Classify(newAPIError(429, ""))
 	if !got.Retryable {
 		t.Error("429 should be retryable")
 	}
@@ -102,10 +138,10 @@ func TestClassifyRateLimitIsRetryable(t *testing.T) {
 }
 
 func TestClassifyServerErrorIsRetryable(t *testing.T) {
-	if !Classify(&stubAPIError{status: 529, msg: "overloaded_error"}).Retryable {
+	if !Classify(newAPIError(529, "")).Retryable {
 		t.Error("529 should be retryable")
 	}
-	if !Classify(&stubAPIError{status: 500, msg: "api_error"}).Retryable {
+	if !Classify(newAPIError(500, "")).Retryable {
 		t.Error("500 should be retryable")
 	}
 }
@@ -157,16 +193,3 @@ func TestLiveEnrichment(t *testing.T) {
 		t.Error("live call returned an empty title")
 	}
 }
-
-// stubAPIError mimics the shape Classify inspects. The real SDK error type is
-// substituted in Step 5 once the exact field names are confirmed against the
-// compiler; this keeps the pure logic testable either way.
-type stubAPIError struct {
-	status    int
-	msg       string
-	requestID string
-}
-
-func (e *stubAPIError) Error() string     { return e.msg }
-func (e *stubAPIError) StatusCode() int   { return e.status }
-func (e *stubAPIError) RequestID() string { return e.requestID }
