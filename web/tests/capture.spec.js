@@ -58,6 +58,42 @@ test('a deep link to a single idea loads directly', async ({ page }) => {
   await expect(page.locator('.inspector')).toContainText(unique);
 });
 
+// The list deliberately excludes archived ideas, so an archived idea is one
+// of the three cases (with merged and past-the-500-row-limit) where the
+// loaded list cannot answer a deep link. Before the fallback fetch existed
+// this rendered a blank workspace with no error — and an old Telegram [Open]
+// link is exactly how you arrive here.
+test('a deep link to an archived idea still renders it', async ({ page }) => {
+  await page.goto('/ideas');
+
+  const unique = `archived-deeplink-${Date.now()}`;
+  await page.fill('.capture-control textarea', unique);
+  await page.click('button:has-text("Save idea")');
+  await expect(page.locator('.idea-row').first()).toContainText(unique);
+
+  // Saving navigated to /ideas/<id>; keep that URL to come back to.
+  const url = page.url();
+  expect(url).toMatch(/\/ideas\/[0-9a-f-]{36}$/);
+
+  await page.click('.idea-row:first-child');
+  await page.click('.inspector button:has-text("Archive")');
+  await expect(page.locator('.idea-row', { hasText: unique })).toHaveCount(0);
+
+  // A cold load of the deep link, with the idea absent from the default list.
+  await page.goto(url);
+  await expect(page.locator('.inspector')).toContainText(unique);
+  // And it must be the real idea, not an error pane.
+  await expect(page.locator('.inspector button:has-text("Restore")')).toBeVisible();
+});
+
+test('a deep link to an idea that does not exist says so', async ({ page }) => {
+  await page.goto('/ideas/00000000-0000-7000-8000-000000000000');
+
+  const inspector = page.locator('.inspector');
+  await expect(inspector).toBeVisible();
+  await expect(inspector).toContainText('gone');
+});
+
 test('a correction is marked and persists across a reload', async ({ page }) => {
   await page.goto('/ideas');
 

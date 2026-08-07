@@ -39,6 +39,12 @@ export function listIdeas(params = {}) {
   return request(`/api/ideas${qs ? `?${qs}` : ''}`);
 }
 
+// getIdea is the fallback behind a deep link. The list is the fast path, but
+// it cannot answer for an idea that is archived, merged into another, or past
+// the 500-row limit — and /ideas/<id> has to resolve for all three, since
+// that is what Telegram's [Open] button points at.
+export const getIdea = (id) => request(`/api/ideas/${id}`);
+
 export const createIdea = (rawText) =>
   request('/api/ideas', { method: 'POST', body: { raw_text: rawText, source: 'web' } });
 

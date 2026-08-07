@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 
+import { getIdea } from '../lib/api.js';
 import { thumbnailProps } from '../lib/thumbnail.js';
 import { Icon } from './Icon.jsx';
 
@@ -474,12 +475,62 @@ function IdeaInspector({ idea, allIdeas, store, guard, announce, onSelect, onClo
   );
 }
 
+// useSelectedIdea resolves the id in the URL to an idea to show.
+//
+// The loaded list answers the common case, but it deliberately excludes
+// archived and merged ideas and is capped at 500 rows — so following
+// /ideas/<id> for any of those found nothing and rendered a blank pane with
+// no error at all. The router exists precisely so those deep links resolve
+// (spec §8), and Telegram's [Open] button is the main thing pointing at them.
+//
+// The fetch is the fallback, not the primary path: an idea already on screen
+// must not trigger a round trip, and must keep updating live over SSE.
+function useSelectedIdea(ideas, selectedId) {
+  const fromList = ideas.find((idea) => idea.id === selectedId) ?? null;
+  const [fetched, setFetched] = useState(null);
+  const [missing, setMissing] = useState(false);
+
+  // Keyed on whether the list can answer, not on the idea object itself —
+  // that identity changes on every SSE update and would refetch constantly.
+  const listHasIt = Boolean(fromList);
+
+  useEffect(() => {
+    setFetched(null);
+    setMissing(false);
+    if (!selectedId || listHasIt) return undefined;
+
+    let cancelled = false;
+    getIdea(selectedId)
+      .then((idea) => { if (!cancelled) setFetched(idea); })
+      .catch(() => { if (!cancelled) setMissing(true); });
+    return () => { cancelled = true; };
+  }, [selectedId, listHasIt]);
+
+  return { idea: fromList ?? fetched, missing: missing && !listHasIt };
+}
+
+// A deep link that resolves to nothing must say so. Rendering an empty pane
+// leaves the reader unable to tell a deleted idea from a broken app.
+function MissingIdea({ id, onClose }) {
+  return (
+    <aside className="inspector" aria-label="Idea not found">
+      <button className="icon-button inspector-close" type="button" onClick={onClose} aria-label="Close details">
+        <Icon name="x" size={20} />
+      </button>
+      <h2>That idea is gone</h2>
+      <p className="muted-copy">
+        Nothing here matches <code>{id}</code>. It was probably deleted.
+      </p>
+    </aside>
+  );
+}
+
 export function IdeasWorkspace({
   store, filters: active, onFiltersChange, selectedId, onSelect,
   captureValue, onCaptureChange, onCreate, onCaptureFocus, announce, guard,
 }) {
   const { ideas, loading, error } = store;
-  const selectedIdea = ideas.find((idea) => idea.id === selectedId) ?? null;
+  const { idea: selectedIdea, missing } = useSelectedIdea(ideas, selectedId);
   const retry = guard(store.reenrich, 'Retrying enrichment…');
 
   // Ticks only while an idea is pending, so a row can notice it has gone
@@ -571,6 +622,7 @@ export function IdeasWorkspace({
             onClose={() => onSelect(null)}
           />
         )}
+        {missing && <MissingIdea id={selectedId} onClose={() => onSelect(null)} />}
       </div>
     </main>
   );
