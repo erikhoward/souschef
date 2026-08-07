@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/erikhoward/souschef/internal/ideas"
 	"github.com/erikhoward/souschef/internal/store"
@@ -48,6 +49,33 @@ func TestDeriveTitleTruncatesLongSingleSentence(t *testing.T) {
 	got := ideas.DeriveTitle(long)
 	if len(got) > 60 {
 		t.Errorf("len = %d, want <= 60", len(got))
+	}
+}
+
+// Captured recipe text is routinely multi-byte: café, jalapeño, crème
+// fraîche, sauté, purée, and Telegram voice transcripts we don't control
+// (which may include emoji). A byte-offset cut can split a rune mid-way and
+// silently corrupt the title — SQLite doesn't validate UTF-8 and
+// encoding/json substitutes U+FFFD rather than erroring, so this fails
+// quietly rather than loudly.
+func TestDeriveTitleTruncatesOnRuneBoundaries(t *testing.T) {
+	cases := map[string]string{
+		"emoji":    strings.Repeat("😀", 200),
+		"accented": strings.Repeat("é", 200),
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := ideas.DeriveTitle(raw)
+			if !utf8.ValidString(got) {
+				t.Errorf("DeriveTitle produced invalid UTF-8: %q", got)
+			}
+			if n := utf8.RuneCountInString(got); n > 60 {
+				t.Errorf("rune count = %d, want <= 60", n)
+			}
+			if got == "" {
+				t.Error("DeriveTitle returned an empty string")
+			}
+		})
 	}
 }
 

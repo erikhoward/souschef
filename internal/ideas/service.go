@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -57,14 +58,45 @@ func DeriveTitle(raw string) string {
 	if len(s) <= 60 {
 		return s
 	}
-	// "…" is 3 bytes in UTF-8, so the cut must reserve room for it — otherwise
-	// the result runs 3 bytes past the 60-byte cap the test enforces.
+
+	// "…" is 3 bytes in UTF-8, so the cut must reserve room for it. The cut
+	// point itself must also land on a rune boundary: slicing at a raw byte
+	// offset can split a multi-byte rune in half and produce invalid UTF-8.
+	// Captured recipe text routinely contains multi-byte runes — café,
+	// jalapeño, crème fraîche, sauté, purée — and Telegram voice transcripts
+	// are machine-generated prose we don't control, so this isn't a
+	// hypothetical edge case. Walking the string rune-by-rune and only ever
+	// accepting a whole rune's bytes guarantees the cut never lands mid-rune.
 	const ellipsis = "…"
-	cut := s[:60-len(ellipsis)]
-	if sp := strings.LastIndex(cut, " "); sp > 20 {
+	budget := 60 - len(ellipsis)
+	cutBytes := 0
+	for i, r := range s {
+		end := i + utf8.RuneLen(r)
+		if end > budget {
+			break
+		}
+		cutBytes = end
+	}
+
+	// The word-boundary backup below operates on the []rune form rather than
+	// a byte index into the string, so it can't reintroduce the same
+	// mid-rune-split hazard the walk above exists to avoid.
+	cut := []rune(s[:cutBytes])
+	if sp := lastSpaceRune(cut); sp > 20 {
 		cut = cut[:sp]
 	}
-	return strings.TrimSpace(cut) + ellipsis
+	return strings.TrimSpace(string(cut)) + ellipsis
+}
+
+// lastSpaceRune returns the index of the last space rune in cut, or -1 if
+// there is none.
+func lastSpaceRune(cut []rune) int {
+	for i := len(cut) - 1; i >= 0; i-- {
+		if cut[i] == ' ' {
+			return i
+		}
+	}
+	return -1
 }
 
 func (s *Service) Create(ctx context.Context, rawText string, source Source, sourceRef string) (Idea, error) {
