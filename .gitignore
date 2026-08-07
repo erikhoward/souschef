@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.playwright-mcp/
+.superpowers/
+.env
+*.db
+*.db-shm
+*.db-wal
+data/
+models/
