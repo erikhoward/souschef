@@ -123,7 +123,7 @@ func run() error {
 		Client:      telegramClient,
 		Ideas:       ideaService,
 		Enricher:    enricher,
-		Transcriber: transcribe.New(cfg.WhisperBin, cfg.WhisperModel),
+		Transcriber: transcribe.New(cfg.WhisperBin, cfg.WhisperModel, cfg.FFmpegBin),
 		ChatID:      cfg.TelegramChatID,
 		AudioDir:    cfg.AudioDir,
 		WebBaseURL:  fmt.Sprintf("http://127.0.0.1:%d", cfg.Port),

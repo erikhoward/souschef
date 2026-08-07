@@ -28,6 +28,7 @@ type Config struct {
 	TelegramChatID int64
 	WhisperBin     string
 	WhisperModel   string
+	FFmpegBin      string
 	AudioDir       string
 
 	// LoadedDotEnv reports whether a .env file in the working directory was
@@ -87,6 +88,7 @@ func Load() (Config, error) {
 		TelegramToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 		WhisperBin:    env("WHISPER_BIN", "/opt/homebrew/bin/whisper-cli"),
 		WhisperModel:  env("WHISPER_MODEL", "./models/ggml-base.en.bin"),
+		FFmpegBin:     env("FFMPEG_BIN", "/opt/homebrew/bin/ffmpeg"),
 		AudioDir:      env("AUDIO_DIR", "./data/audio"),
 	}
 
@@ -128,6 +130,19 @@ func Load() (Config, error) {
 		problems = append(problems, fmt.Sprintf(
 			"WHISPER_MODEL %q not found — download a ggml model from "+
 				"https://huggingface.co/ggerganov/whisper.cpp", cfg.WhisperModel))
+	}
+
+	// ffmpeg is required, not optional. Telegram sends 48kHz Ogg/Opus and
+	// whisper.cpp cannot decode it — it fails the read and then exits 0, so a
+	// missing ffmpeg surfaces as a mysteriously empty transcript rather than
+	// anything actionable. Catch it here instead.
+	if info, err := os.Stat(cfg.FFmpegBin); err != nil {
+		problems = append(problems, fmt.Sprintf(
+			"FFMPEG_BIN %q not found — install with `brew install ffmpeg`. "+
+				"It converts Telegram's Ogg/Opus voice notes to the 16kHz WAV whisper.cpp requires",
+			cfg.FFmpegBin))
+	} else if info.Mode()&0o111 == 0 {
+		problems = append(problems, fmt.Sprintf("FFMPEG_BIN %q is not executable", cfg.FFmpegBin))
 	}
 
 	if err := os.MkdirAll(cfg.AudioDir, 0o755); err != nil {

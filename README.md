@@ -16,7 +16,7 @@ Run these from the repository root — `models/` is expected there, and it is
 gitignored:
 
 ```bash
-brew install whisper-cpp
+brew install whisper-cpp ffmpeg
 mkdir -p models
 curl -fsSL -o models/ggml-base.en.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
@@ -24,6 +24,11 @@ curl -fsSL -o models/ggml-base.en.bin \
 
 The download is about 148MB. Homebrew installs the binary as
 `/opt/homebrew/bin/whisper-cli`, which is the default `WHISPER_BIN`.
+
+**ffmpeg is required, not optional.** Telegram sends voice notes as 48kHz
+Ogg/Opus, which whisper.cpp cannot decode — it fails the read and then exits
+successfully, so without ffmpeg a voice note fails with a misleading "transcript
+was empty". ffmpeg converts each note to the 16kHz mono WAV whisper needs.
 
 Note that whisper.cpp gates **startup**, not just voice notes: the app
 verifies the binary and the model exist before it will run at all.
