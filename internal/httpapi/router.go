@@ -9,6 +9,8 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/erikhoward/souschef/internal/ideas"
@@ -31,9 +33,16 @@ type Server struct {
 	ideas    *ideas.Service
 	enricher Enricher
 	hub      *Hub
+	mux      *http.ServeMux
+
+	// wg and inFlight track background enrichment goroutines started by
+	// EnrichInBackground, so Drain can wait for them before the caller
+	// closes the store. See Drain for why this matters.
+	wg       sync.WaitGroup
+	inFlight atomic.Int64
 }
 
-func New(deps Deps) http.Handler {
+func New(deps Deps) *Server {
 	s := &Server{ideas: deps.Ideas, enricher: deps.Enricher, hub: deps.Hub}
 
 	mux := http.NewServeMux()
@@ -50,7 +59,43 @@ func New(deps Deps) http.Handler {
 	mux.HandleFunc("DELETE /api/ideas/{id}/links/{other}", s.removeLink)
 	mux.HandleFunc("POST /api/ideas/{id}/merge", s.mergeIdea)
 	mux.HandleFunc("GET /events", s.hub.ServeHTTP)
-	return mux
+	s.mux = mux
+	return s
+}
+
+// ServeHTTP makes *Server itself an http.Handler, so callers that don't need
+// the drain machinery can keep treating it as one.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mux.ServeHTTP(w, r)
+}
+
+// Drain waits for in-flight background enrichment goroutines (started by
+// EnrichInBackground) to finish, bounded by ctx.
+//
+// This must run after the HTTP server has stopped accepting new requests
+// but before the caller closes the store: EnrichInBackground detaches a
+// goroutine with its own 5-minute timeout, and if the store closes while
+// one is still writing its result, the write fails with "sql: database is
+// closed", the error is logged and swallowed, and the idea is left stuck
+// at enrichment_status = 'pending' with its result silently lost.
+//
+// If ctx is done before every goroutine finishes (a hung upstream call
+// must not block process exit forever), Drain logs how many were still
+// running rather than exiting silently.
+func (s *Server) Drain(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		if n := s.inFlight.Load(); n > 0 {
+			log.Printf("httpapi: shutdown grace period expired with %d enrichment goroutine(s) still running", n)
+		}
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -130,8 +175,16 @@ func (s *Server) createIdea(w http.ResponseWriter, r *http.Request) {
 
 // EnrichInBackground classifies an idea and pushes the result over SSE. It
 // runs detached from the request, so it uses its own context.
+//
+// The goroutine is tracked via wg/inFlight so Drain can wait for it to
+// finish before the store is closed underneath it.
 func (s *Server) EnrichInBackground(id, rawText string) {
+	s.wg.Add(1)
+	s.inFlight.Add(1)
 	go func() {
+		defer s.wg.Done()
+		defer s.inFlight.Add(-1)
+
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 

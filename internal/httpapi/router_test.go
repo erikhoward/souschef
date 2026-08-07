@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/erikhoward/souschef/internal/httpapi"
 	"github.com/erikhoward/souschef/internal/ideas"
@@ -32,16 +33,28 @@ func newTestServer(t *testing.T, e httpapi.Enricher) http.Handler {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { st.Close() })
 
 	hub := httpapi.NewHub()
 	t.Cleanup(hub.Close)
 
-	return httpapi.New(httpapi.Deps{
+	srv := httpapi.New(httpapi.Deps{
 		Ideas:    ideas.NewService(st),
 		Enricher: e,
 		Hub:      hub,
 	})
+
+	// Drain any in-flight background enrichment before closing the store,
+	// mirroring what run() must do at shutdown — otherwise a goroutine
+	// still writing its result races st.Close() and fails with
+	// "sql: database is closed".
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Drain(ctx)
+		st.Close()
+	})
+
+	return srv
 }
 
 func post(t *testing.T, h http.Handler, path string, body any) *httptest.ResponseRecorder {
