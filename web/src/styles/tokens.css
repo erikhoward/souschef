@@ -1,0 +1,66 @@
+/* Slate & Sage.
+ *
+ * The accent replaces the previous tomato red. It is not a new colour: the
+ * stylesheet already used greens (#516649, #5e8761, #4d6448) for recipe and
+ * review sections, so this promotes one that was already present.
+ *
+ * Status dots keep their own values and are always paired with a text label,
+ * because the accent sits nearer the status greens than a cooler accent would.
+ */
+
+@font-face {
+  font-family: 'Inter';
+  src: url('../assets/fonts/inter-400.woff2') format('woff2');
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('../assets/fonts/inter-500.woff2') format('woff2');
+  font-weight: 500; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('../assets/fonts/inter-600.woff2') format('woff2');
+  font-weight: 600; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'Archivo';
+  src: url('../assets/fonts/archivo-700.woff2') format('woff2');
+  font-weight: 700; font-style: normal; font-display: swap;
+}
+
+:root {
+  --bg: #f6f3ec;
+  --surface: #fcfaf5;
+  --surface-alt: #f4efe6;
+  --border: #dbd4c6;
+  --border-strong: #c6bdac;
+
+  --text: #24221d;
+  --muted: #736c62;
+  --faint: #8a8378;
+
+  --accent: #4f6b4a;
+  --accent-hover: #3f5a3b;
+  --accent-soft: #eaeee4;
+  --on-accent: #fbfdf8;
+
+  --danger: #8d3023;
+  --warn: #c98a2e;
+
+  --status-idea: #8a8378;
+  --status-brief: #c98a2e;
+  --status-recipe: #667f61;
+  --status-ready: #5e8761;
+  --status-archived: #a49c90;
+
+  --difficulty-easy: #619061;
+  --difficulty-moderate: #ce9935;
+  --difficulty-insane: #b04a2f;
+
+  --font-display: 'Archivo', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-ui: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  --radius: 6px;
+  --radius-sm: 4px;
+}
