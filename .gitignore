@@ -8,3 +8,4 @@ dist/
 *.db-wal
 /data/
 /models/
+/bin/
