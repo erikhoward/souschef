@@ -21,12 +21,19 @@ const apiBase = "https://api.telegram.org"
 
 type Client struct {
 	token string
-	http  *http.Client
+	// baseURL is apiBase in production. It exists as a field, rather than the
+	// const being used directly, so package-internal tests can point the
+	// client at an httptest server or an unreachable host — without it there
+	// is no way to exercise the transport-failure path at all, which is
+	// precisely the path that used to leak the token.
+	baseURL string
+	http    *http.Client
 }
 
 func NewClient(token string) *Client {
 	return &Client{
-		token: token,
+		token:   token,
+		baseURL: apiBase,
 		// Longer than the long-poll timeout below, so getUpdates is never cut
 		// off by the transport.
 		http: &http.Client{Timeout: 90 * time.Second},
@@ -50,7 +57,7 @@ func (c *Client) call(ctx context.Context, method string, payload, out any) erro
 		body = bytes.NewReader(buf)
 	}
 
-	url := fmt.Sprintf("%s/bot%s/%s", apiBase, c.token, method)
+	url := fmt.Sprintf("%s/bot%s/%s", c.baseURL, c.token, method)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
 		return fmt.Errorf("build %s request: %w", method, err)
@@ -210,7 +217,7 @@ func (c *Client) DownloadFile(ctx context.Context, fileID, dir string) (string, 
 		return "", err
 	}
 
-	url := fmt.Sprintf("%s/file/bot%s/%s", apiBase, c.token, filePath)
+	url := fmt.Sprintf("%s/file/bot%s/%s", c.baseURL, c.token, filePath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err

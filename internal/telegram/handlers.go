@@ -116,7 +116,7 @@ func (b *Bot) handleCallback(ctx context.Context, update Update) error {
 		if _, err := b.Ideas.MarkPending(ctx, id); err != nil {
 			return err
 		}
-		go b.enrichAndEdit(idea.ID, idea.RawText, query.Message.MessageID)
+		b.enrichInBackground(idea.ID, idea.RawText, query.Message.MessageID)
 		return nil
 
 	default:

@@ -24,9 +24,11 @@ import (
 var version = "0.1.0-dev"
 
 // enrichDrainGrace bounds how long shutdown waits for in-flight background
-// enrichment (internal/httpapi's EnrichInBackground) to finish before the
-// store is closed underneath it. A hung upstream call must not block exit
-// forever, so this is generous but not unlimited.
+// enrichment to finish before the store is closed underneath it. It covers
+// both surfaces that detach enrichment goroutines: internal/httpapi's
+// EnrichInBackground and internal/telegram's enrichInBackground. A hung
+// upstream call must not block exit forever, so this is generous but not
+// unlimited.
 const enrichDrainGrace = 30 * time.Second
 
 func main() {
@@ -60,12 +62,13 @@ func run() error {
 	})
 
 	// st.Close() is deferred, so it fires last, after run() returns. That is
-	// still too early on its own: EnrichInBackground detaches goroutines
-	// with their own 5-minute timeout, and if one is still mid-write when
-	// the store closes, the write fails with "sql: database is closed" and
-	// the idea is stuck at enrichment_status = 'pending' with its result
-	// silently lost. The shutdown path below calls api.Drain(...) inline —
-	// not via another defer — precisely so it blocks before this function
+	// still too early on its own: both the web path and the Telegram bot
+	// detach enrichment goroutines with their own 5-minute timeout, and if
+	// one is still mid-write when the store closes, the write fails with
+	// "sql: database is closed" and the idea is stuck at
+	// enrichment_status = 'pending' with its result silently lost. The
+	// shutdown path below calls api.Drain(...) and bot.Drain(...) inline —
+	// not via another defer — precisely so they block before this function
 	// returns and st.Close() runs, rather than racing it.
 	defer st.Close()
 
@@ -115,12 +118,16 @@ func run() error {
 	defer cancel()
 	shutdownErr := srv.Shutdown(shutdownCtx)
 
-	// The HTTP server no longer accepts requests once Shutdown returns, so
-	// no new enrichment goroutines can start. Drain the ones already
-	// running before the deferred st.Close() above executes.
+	// The HTTP server no longer accepts requests once Shutdown returns, and
+	// bot.Run returns as soon as ctx is cancelled, so no new enrichment
+	// goroutines can start on either surface. Drain the ones already running
+	// before the deferred st.Close() above executes. Both calls share one
+	// grace period: they run concurrently in the background, so the bound is
+	// on total shutdown time, not per-surface.
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), enrichDrainGrace)
 	defer drainCancel()
 	api.Drain(drainCtx)
+	bot.Drain(drainCtx)
 
 	return shutdownErr
 }

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/erikhoward/souschef/internal/ideas"
@@ -31,6 +33,13 @@ type Deps struct {
 type Bot struct {
 	Deps
 	offset int64
+
+	// wg and inFlight track the background enrichment goroutines started by
+	// enrichInBackground, so Drain can wait for them before the caller closes
+	// the store. This mirrors httpapi.Server exactly — see Drain for why the
+	// web path's treatment has to extend here.
+	wg       sync.WaitGroup
+	inFlight atomic.Int64
 }
 
 func New(deps Deps) (*Bot, error) {
@@ -38,6 +47,53 @@ func New(deps Deps) (*Bot, error) {
 		return nil, err
 	}
 	return &Bot{Deps: deps}, nil
+}
+
+// Drain waits for in-flight background enrichment goroutines (started by
+// enrichInBackground) to finish, bounded by ctx.
+//
+// This must run after the bot has stopped polling but before the caller
+// closes the store, for the same reason httpapi.Server.Drain does:
+// enrichAndEdit is detached with its own 5-minute timeout, and if the store
+// closes while one is still writing its result, the write fails with
+// "sql: database is closed", the error is logged and swallowed, and the idea
+// is left stuck at enrichment_status = 'pending'.
+//
+// It is worse here than on the web path. The web UI grows a Retry affordance
+// on a stale pending row, but RenderIdeaCard only offers Retry for a 'failed'
+// idea — so a Telegram capture lost this way sits at "✓ Saved. Reading it
+// now…" forever with no in-chat recovery at all.
+//
+// If ctx is done before every goroutine finishes (a hung upstream call must
+// not block process exit forever), Drain logs how many were still running
+// rather than exiting silently.
+func (b *Bot) Drain(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		b.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		if n := b.inFlight.Load(); n > 0 {
+			log.Printf("telegram: shutdown grace period expired with %d enrichment goroutine(s) still running", n)
+		}
+	}
+}
+
+// enrichInBackground runs enrichAndEdit detached from the update loop, but
+// tracked, so Drain can wait for it. Every caller must go through here — a
+// bare `go b.enrichAndEdit(...)` is invisible to shutdown.
+func (b *Bot) enrichInBackground(ideaID, rawText string, messageID int64) {
+	b.wg.Add(1)
+	b.inFlight.Add(1)
+	go func() {
+		defer b.wg.Done()
+		defer b.inFlight.Add(-1)
+		b.enrichAndEdit(ideaID, rawText, messageID)
+	}()
 }
 
 const longPollSeconds = 30
@@ -175,7 +231,7 @@ func (b *Bot) capture(ctx context.Context, rawText string, source ideas.Source, 
 		return err
 	}
 
-	go b.enrichAndEdit(idea.ID, idea.RawText, sent.MessageID)
+	b.enrichInBackground(idea.ID, idea.RawText, sent.MessageID)
 	return nil
 }
 
@@ -246,7 +302,7 @@ func (b *Bot) handleVoice(ctx context.Context, update Update) error {
 		return err
 	}
 
-	go b.enrichAndEdit(idea.ID, idea.RawText, sent.MessageID)
+	b.enrichInBackground(idea.ID, idea.RawText, sent.MessageID)
 	return nil
 }
 
