@@ -1,0 +1,2885 @@
+# Sous Chef Milestone 1 Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Capture recipe and video ideas instantly from a web app or Telegram (text or voice), have Claude infer their metadata in the background, and organize the resulting backlog.
+
+**Architecture:** A single Go binary serves a REST API and the built React app from `embed.FS`. Capture writes to SQLite and returns immediately; a goroutine then calls Claude and pushes the enriched row to the browser over Server-Sent Events. Telegram uses outbound long polling, so no public URL is needed. Only `internal/store` writes SQL; `internal/enrich` is a pure function from text to metadata and never touches the database.
+
+**Tech Stack:** Go 1.26, `modernc.org/sqlite` (pure Go, FTS5 built in — no cgo), `github.com/anthropics/anthropic-sdk-go`, `github.com/google/uuid`, React 19 + Vite 8, Playwright. Telegram is a hand-rolled ~150-line client over `net/http` — we need seven Bot API methods and would otherwise inherit an SDK's release cadence for no gain.
+
+**Spec:** `docs/superpowers/specs/2026-08-06-souschef-capture-design.md`
+
+## Global Constraints
+
+- Module path is `github.com/erikhoward/souschef`.
+- **Only `internal/store` writes SQL.** Every other package goes through it.
+- **`internal/enrich` never touches the database.** It takes text, returns metadata or an error.
+- Model default is `claude-sonnet-5`, read from `SOUSCHEF_MODEL`. Never hardcode a model ID outside `config`.
+- Use `output_config.format` with a JSON schema for structured output. The top-level `output_format` parameter is deprecated — do not use it.
+- Use `thinking: {type: "adaptive"}`. Never send `budget_tokens`, `temperature`, `top_p`, or `top_k` — all four return 400 on Sonnet 5.
+- Enrichment failures are **never silent.** Every failure writes verbatim error text to `ideas.enrichment_error` and sets `enrichment_status='failed'`.
+- Archive is reversible and **must preserve `stage`.** Delete is permanent.
+- Palette and type are CSS custom properties on `:root`. Accent is `#4f6b4a`. Fonts are self-hosted woff2 — no CDN.
+- Every task ends on a green test run and a commit.
+- Branch: `feat/milestone-1-capture`. Do not commit to `main`.
+
+## Phases
+
+| Phase | Tasks | Deliverable |
+|---|---|---|
+| 0 — Foundation | 1–2 | Restructured repo, config that fails fast |
+| 1 — Persistence | 3–6 | SQLite with FTS5, full domain logic |
+| 2 — Intelligence | 7 | Claude enrichment, fixture-tested offline |
+| 3 — Serving | 8–10 | REST + SSE + single binary |
+| 4 — Interface | 11–13 | Retheme, live data, correction UI |
+| 5 — Telegram | 14–17 | Voice, capture, tappable search, e2e |
+
+---
+
+## File Structure
+
+**Created:**
+
+| Path | Responsibility |
+|---|---|
+| `cmd/souschef/main.go` | Wire config → store → services → HTTP + Telegram; graceful shutdown |
+| `internal/config/config.go` | Env loading, validation, fail-fast startup checks |
+| `internal/store/store.go` | Connection, migration runner |
+| `internal/store/ideas.go` | Idea row read/write, list filtering and sorting |
+| `internal/store/search.go` | FTS5 query |
+| `internal/store/relations.go` | Notes, tags, links, merge |
+| `internal/ideas/idea.go` | Domain types and enum constants |
+| `internal/ideas/service.go` | Create, correct, archive, restore, link, merge rules |
+| `internal/enrich/enrich.go` | Claude call, schema, error classification |
+| `internal/enrich/prompt.go` | Taxonomy system prompt |
+| `internal/transcribe/whisper.go` | whisper.cpp subprocess wrapper |
+| `internal/telegram/client.go` | Bot API HTTP client |
+| `internal/telegram/commands.go` | Command registry — single source of truth |
+| `internal/telegram/bot.go` | Long-poll loop, routing, handlers |
+| `internal/httpapi/router.go` | Routes, JSON encoding, embedded assets |
+| `internal/httpapi/sse.go` | Subscriber hub |
+| `migrations/0001_init.sql` | Schema + FTS5 triggers |
+| `web/src/hooks/useIdeas.js` | Fetch, optimistic insert, SSE reconnect |
+| `web/src/lib/api.js` | Typed fetch wrappers |
+
+**Moved:** `index.html`, `package.json`, `bun.lock`, `public/`, `src/`, `tests/` → under `web/`.
+
+**Deleted:** `web/src/lib/pipeline.js`, `web/src/data/ideas.js`, `web/src/components/RecipeWorkspace.jsx`, `web/tests/pipeline.test.js`, `web/src/assets/recipe-thumbnails.png`.
+
+---
+
+## Task 1: Repo restructure and Go module
+
+**Files:**
+- Create: `go.mod`, `cmd/souschef/main.go`, `cmd/souschef/main_test.go`, `Makefile`, `.env.example`
+- Move: `index.html`, `package.json`, `bun.lock`, `public/`, `src/`, `tests/` → `web/`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: module `github.com/erikhoward/souschef`; `main.version` string; a working `make build`, `make dev`, `make test`.
+
+- [ ] **Step 1: Create the branch**
+
+```bash
+git checkout -b feat/milestone-1-capture
+```
+
+- [ ] **Step 2: Move the web app with git mv so history follows**
+
+```bash
+mkdir -p web
+git mv index.html package.json bun.lock public src tests web/
+git mv .gitignore .gitignore.tmp && git mv .gitignore.tmp .gitignore  # no-op, keeps ignore at root
+ls web/
+```
+
+Expected: `bun.lock  index.html  package.json  public  src  tests`
+
+- [ ] **Step 3: Verify the web app still builds from its new home**
+
+```bash
+cd web && bun run build && cd ..
+```
+
+Expected: `✓ built in ...ms`. If Vite complains about a missing root, that is expected — it resolves because `index.html` moved alongside `package.json`.
+
+- [ ] **Step 4: Initialise the Go module**
+
+```bash
+go mod init github.com/erikhoward/souschef
+```
+
+- [ ] **Step 5: Write the failing test**
+
+Create `cmd/souschef/main_test.go`:
+
+```go
+package main
+
+import "testing"
+
+func TestVersionIsSet(t *testing.T) {
+	if version == "" {
+		t.Fatal("version must not be empty")
+	}
+}
+```
+
+- [ ] **Step 6: Run it to make sure it fails**
+
+Run: `go test ./cmd/souschef/ -run TestVersionIsSet -v`
+Expected: FAIL — `undefined: version`
+
+- [ ] **Step 7: Write the minimal implementation**
+
+Create `cmd/souschef/main.go`:
+
+```go
+package main
+
+import "fmt"
+
+// version is overridden at build time via -ldflags.
+var version = "0.1.0-dev"
+
+func main() {
+	fmt.Printf("souschef %s\n", version)
+}
+```
+
+- [ ] **Step 8: Run the test to make sure it passes**
+
+Run: `go test ./cmd/souschef/ -run TestVersionIsSet -v`
+Expected: PASS
+
+- [ ] **Step 9: Write the Makefile**
+
+Create `Makefile` (tabs, not spaces, for recipe lines):
+
+```makefile
+.PHONY: dev build test clean
+
+dev:
+	@echo "Starting Go API on :8420 and Vite on :5173"
+	@(cd web && bun run dev) & go run ./cmd/souschef
+
+build:
+	cd web && bun install --frozen-lockfile && bun run build
+	go build -ldflags "-X main.version=$$(git describe --tags --always --dirty)" -o bin/souschef ./cmd/souschef
+	@echo "Built bin/souschef"
+
+test:
+	go test ./... -race
+	cd web && bunx playwright test
+
+clean:
+	rm -rf bin web/dist
+```
+
+- [ ] **Step 10: Verify build and test targets run**
+
+```bash
+make build && ./bin/souschef
+```
+
+Expected: `Built bin/souschef` then `souschef <git-sha>`
+
+- [ ] **Step 11: Write .env.example**
+
+Create `.env.example`:
+
+```
+# Anthropic — or leave unset and use an `ant auth login` profile
+ANTHROPIC_API_KEY=
+SOUSCHEF_MODEL=claude-sonnet-5
+SOUSCHEF_EFFORT=low
+
+SOUSCHEF_DB_PATH=./souschef.db
+SOUSCHEF_PORT=8420
+
+# Telegram — token from BotFather. Commands are published by this app, not BotFather.
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_ALLOWED_CHAT_ID=
+
+# whisper.cpp — see README for install
+WHISPER_BIN=/opt/homebrew/bin/whisper-cli
+WHISPER_MODEL=./models/ggml-base.en.bin
+AUDIO_DIR=./data/audio
+```
+
+- [ ] **Step 12: Add bin/ to .gitignore**
+
+Append to `.gitignore`:
+
+```
+/bin/
+```
+
+- [ ] **Step 13: Commit**
+
+```bash
+git add -A
+git commit -m "refactor: move web app into web/, add Go module and Makefile
+
+Makes room for the backend beside the frontend. git mv preserves history
+on the moved files. Adds a version-stamped build and .env.example.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 2: Config loading and fail-fast validation
+
+This is the direct fix for the prior incident where a dead key surfaced as an indefinite hang. Every prerequisite is checked at boot.
+
+**Files:**
+- Create: `internal/config/config.go`, `internal/config/config_test.go`
+- Modify: `cmd/souschef/main.go`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: `config.Config` struct; `config.Load() (Config, error)`; `config.ErrMissing` sentinel. Fields used by later tasks: `DBPath`, `Port`, `Model`, `Effort`, `AnthropicKey`, `TelegramToken`, `TelegramChatID int64`, `WhisperBin`, `WhisperModel`, `AudioDir`.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `internal/config/config_test.go`:
+
+```go
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func setEnv(t *testing.T, kv map[string]string) {
+	t.Helper()
+	for _, k := range []string{
+		"ANTHROPIC_API_KEY", "SOUSCHEF_MODEL", "SOUSCHEF_EFFORT", "SOUSCHEF_DB_PATH",
+		"SOUSCHEF_PORT", "TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_CHAT_ID",
+		"WHISPER_BIN", "WHISPER_MODEL", "AUDIO_DIR",
+	} {
+		os.Unsetenv(k)
+	}
+	for k, v := range kv {
+		t.Setenv(k, v)
+	}
+}
+
+// validEnv returns an environment that should load cleanly, with real files
+// on disk for the whisper binary and model.
+func validEnv(t *testing.T) map[string]string {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "whisper-cli")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	model := filepath.Join(dir, "ggml-base.en.bin")
+	if err := os.WriteFile(model, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return map[string]string{
+		"ANTHROPIC_API_KEY":        "sk-ant-test",
+		"SOUSCHEF_DB_PATH":         filepath.Join(dir, "test.db"),
+		"TELEGRAM_BOT_TOKEN":       "123:abc",
+		"TELEGRAM_ALLOWED_CHAT_ID": "42",
+		"WHISPER_BIN":              bin,
+		"WHISPER_MODEL":            model,
+		"AUDIO_DIR":                filepath.Join(dir, "audio"),
+	}
+}
+
+func TestLoadAppliesDefaults(t *testing.T) {
+	setEnv(t, validEnv(t))
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("expected clean load, got %v", err)
+	}
+	if cfg.Model != "claude-sonnet-5" {
+		t.Errorf("Model = %q, want claude-sonnet-5", cfg.Model)
+	}
+	if cfg.Effort != "low" {
+		t.Errorf("Effort = %q, want low", cfg.Effort)
+	}
+	if cfg.Port != 8420 {
+		t.Errorf("Port = %d, want 8420", cfg.Port)
+	}
+	if cfg.TelegramChatID != 42 {
+		t.Errorf("TelegramChatID = %d, want 42", cfg.TelegramChatID)
+	}
+}
+
+func TestLoadFailsOnMissingWhisperBinary(t *testing.T) {
+	env := validEnv(t)
+	env["WHISPER_BIN"] = "/nonexistent/whisper-cli"
+	setEnv(t, env)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for missing whisper binary")
+	}
+	if !strings.Contains(err.Error(), "WHISPER_BIN") {
+		t.Errorf("error must name the offending variable, got: %v", err)
+	}
+}
+
+func TestLoadFailsOnMissingTelegramToken(t *testing.T) {
+	env := validEnv(t)
+	delete(env, "TELEGRAM_BOT_TOKEN")
+	setEnv(t, env)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for missing telegram token")
+	}
+	if !strings.Contains(err.Error(), "TELEGRAM_BOT_TOKEN") {
+		t.Errorf("error must name the offending variable, got: %v", err)
+	}
+}
+
+func TestLoadFailsOnNonNumericChatID(t *testing.T) {
+	env := validEnv(t)
+	env["TELEGRAM_ALLOWED_CHAT_ID"] = "not-a-number"
+	setEnv(t, env)
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for non-numeric chat id")
+	}
+}
+
+func TestLoadCreatesAudioDir(t *testing.T) {
+	env := validEnv(t)
+	setEnv(t, env)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("expected clean load, got %v", err)
+	}
+	info, err := os.Stat(cfg.AudioDir)
+	if err != nil || !info.IsDir() {
+		t.Errorf("AudioDir %q should exist as a directory", cfg.AudioDir)
+	}
+}
+```
+
+- [ ] **Step 2: Run it to make sure it fails**
+
+Run: `go test ./internal/config/ -v`
+Expected: FAIL — `undefined: Load`
+
+- [ ] **Step 3: Write the implementation**
+
+Create `internal/config/config.go`:
+
+```go
+// Package config loads and validates every runtime prerequisite at startup.
+//
+// The design rule here is fail loud, fail early: a missing credential or an
+// unreadable model file stops the process with a message naming the exact
+// environment variable at fault. A previous iteration of this project spent
+// hours diagnosing an enrichment hang that was really a dead API key, so
+// nothing in this package logs a warning and carries on.
+package config
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+)
+
+type Config struct {
+	AnthropicKey   string
+	Model          string
+	Effort         string
+	DBPath         string
+	Port           int
+	TelegramToken  string
+	TelegramChatID int64
+	WhisperBin     string
+	WhisperModel   string
+	AudioDir       string
+}
+
+func env(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
+}
+
+// Load reads configuration from the environment and verifies it. It returns
+// every problem it finds at once rather than stopping at the first, so a fresh
+// checkout surfaces all missing setup in a single run.
+func Load() (Config, error) {
+	cfg := Config{
+		AnthropicKey:  os.Getenv("ANTHROPIC_API_KEY"),
+		Model:         env("SOUSCHEF_MODEL", "claude-sonnet-5"),
+		Effort:        env("SOUSCHEF_EFFORT", "low"),
+		DBPath:        env("SOUSCHEF_DB_PATH", "./souschef.db"),
+		TelegramToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
+		WhisperBin:    env("WHISPER_BIN", "/opt/homebrew/bin/whisper-cli"),
+		WhisperModel:  env("WHISPER_MODEL", "./models/ggml-base.en.bin"),
+		AudioDir:      env("AUDIO_DIR", "./data/audio"),
+	}
+
+	var problems []string
+
+	port, err := strconv.Atoi(env("SOUSCHEF_PORT", "8420"))
+	if err != nil || port < 1 || port > 65535 {
+		problems = append(problems, "SOUSCHEF_PORT must be a number between 1 and 65535")
+	}
+	cfg.Port = port
+
+	// An unset ANTHROPIC_API_KEY is legitimate — the SDK also resolves an
+	// `ant auth login` profile — so we cannot hard-fail here. The enrichment
+	// path reports auth failures per-idea instead.
+
+	if cfg.TelegramToken == "" {
+		problems = append(problems, "TELEGRAM_BOT_TOKEN is required (get one from BotFather)")
+	}
+
+	rawChatID := os.Getenv("TELEGRAM_ALLOWED_CHAT_ID")
+	if rawChatID == "" {
+		problems = append(problems, "TELEGRAM_ALLOWED_CHAT_ID is required (message @userinfobot to find yours)")
+	} else {
+		id, err := strconv.ParseInt(rawChatID, 10, 64)
+		if err != nil {
+			problems = append(problems, "TELEGRAM_ALLOWED_CHAT_ID must be a numeric chat id")
+		}
+		cfg.TelegramChatID = id
+	}
+
+	if info, err := os.Stat(cfg.WhisperBin); err != nil {
+		problems = append(problems, fmt.Sprintf(
+			"WHISPER_BIN %q not found — install with `brew install whisper-cpp`", cfg.WhisperBin))
+	} else if info.Mode()&0o111 == 0 {
+		problems = append(problems, fmt.Sprintf("WHISPER_BIN %q is not executable", cfg.WhisperBin))
+	}
+
+	if _, err := os.Stat(cfg.WhisperModel); err != nil {
+		problems = append(problems, fmt.Sprintf(
+			"WHISPER_MODEL %q not found — download a ggml model from "+
+				"https://huggingface.co/ggerganov/whisper.cpp", cfg.WhisperModel))
+	}
+
+	if err := os.MkdirAll(cfg.AudioDir, 0o755); err != nil {
+		problems = append(problems, fmt.Sprintf("AUDIO_DIR %q could not be created: %v", cfg.AudioDir, err))
+	}
+
+	if len(problems) > 0 {
+		return cfg, fmt.Errorf("configuration problems:\n  - %s", strings.Join(problems, "\n  - "))
+	}
+	return cfg, nil
+}
+```
+
+- [ ] **Step 4: Run the tests to make sure they pass**
+
+Run: `go test ./internal/config/ -v`
+Expected: PASS — all five tests
+
+- [ ] **Step 5: Wire config into main**
+
+Replace `cmd/souschef/main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/erikhoward/souschef/internal/config"
+)
+
+// version is overridden at build time via -ldflags.
+var version = "0.1.0-dev"
+
+func main() {
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "souschef %s failed to start.\n\n%v\n", version, err)
+		os.Exit(1)
+	}
+	log.Printf("souschef %s — db=%s port=%d model=%s", version, cfg.DBPath, cfg.Port, cfg.Model)
+}
+```
+
+- [ ] **Step 6: Verify the failure path is legible**
+
+```bash
+env -u TELEGRAM_BOT_TOKEN -u TELEGRAM_ALLOWED_CHAT_ID go run ./cmd/souschef; echo "exit=$?"
+```
+
+Expected: a `configuration problems:` block naming `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_ID`, and the whisper paths, then `exit=1`.
+
+- [ ] **Step 7: Run the whole suite**
+
+Run: `go test ./... -race`
+Expected: PASS (`cmd/souschef`, `internal/config`)
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add internal/config cmd/souschef
+git commit -m "feat(config): load and validate every prerequisite at startup
+
+Reports all problems at once, each naming the offending variable, and
+refuses to boot rather than failing later. ANTHROPIC_API_KEY is
+deliberately not required — the SDK also resolves an ant auth profile,
+so auth failures surface per-idea on the enrichment path instead.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 3: SQLite connection, migration runner, and schema
+
+**Files:**
+- Create: `internal/store/store.go`, `internal/store/store_test.go`, `migrations/0001_init.sql`
+
+**Interfaces:**
+- Consumes: `config.Config.DBPath`.
+- Produces: `store.Store` struct wrapping `*sql.DB`; `store.Open(path string) (*Store, error)`; `(*Store).Close() error`; `(*Store).DB() *sql.DB`. Migrations are embedded and applied by `Open`.
+
+- [ ] **Step 1: Add dependencies**
+
+```bash
+go get modernc.org/sqlite@latest
+go get github.com/google/uuid@latest
+```
+
+- [ ] **Step 2: Write the failing test**
+
+Create `internal/store/store_test.go`:
+
+```go
+package store
+
+import (
+	"path/filepath"
+	"testing"
+)
+
+// newTestStore opens a store in a temp file. We deliberately do not use
+// :memory: — FTS5 external-content triggers must survive a close and reopen,
+// and an in-memory database would hide a broken trigger definition.
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func TestOpenAppliesMigrations(t *testing.T) {
+	s := newTestStore(t)
+
+	var count int
+	err := s.DB().QueryRow(
+		`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='ideas'`,
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if count != 1 {
+		t.Fatal("ideas table was not created")
+	}
+}
+
+func TestOpenIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+
+	s1, err := Open(path)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	s1.Close()
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopening an already-migrated database must succeed: %v", err)
+	}
+	defer s2.Close()
+
+	var applied int
+	if err := s2.DB().QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&applied); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if applied != 1 {
+		t.Errorf("schema_migrations rows = %d, want 1 (migration applied twice?)", applied)
+	}
+}
+
+func TestForeignKeysEnforced(t *testing.T) {
+	s := newTestStore(t)
+
+	_, err := s.DB().Exec(`INSERT INTO notes (id, idea_id, body, created_at)
+	                       VALUES ('n1', 'does-not-exist', 'orphan', datetime('now'))`)
+	if err == nil {
+		t.Fatal("expected foreign key violation for note with unknown idea_id")
+	}
+}
+
+func TestFTSTableExists(t *testing.T) {
+	s := newTestStore(t)
+
+	var count int
+	err := s.DB().QueryRow(
+		`SELECT count(*) FROM sqlite_master WHERE name='ideas_fts'`,
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if count == 0 {
+		t.Fatal("ideas_fts virtual table was not created")
+	}
+}
+```
+
+- [ ] **Step 3: Run it to make sure it fails**
+
+Run: `go test ./internal/store/ -v`
+Expected: FAIL — `undefined: Open`
+
+- [ ] **Step 4: Write the migration**
+
+Create `migrations/0001_init.sql`:
+
+```sql
+CREATE TABLE ideas (
+    id                 TEXT PRIMARY KEY,
+    title              TEXT NOT NULL,
+    raw_text           TEXT NOT NULL,
+    source             TEXT NOT NULL,
+    source_ref         TEXT,
+    stage              TEXT NOT NULL DEFAULT 'idea',
+    archived_at        DATETIME,
+    merged_into_id     TEXT REFERENCES ideas(id) ON DELETE SET NULL,
+
+    difficulty         TEXT,
+    duration_class     TEXT,
+    treatment          TEXT,
+    content_type       TEXT,
+    cuisine            TEXT,
+    primary_ingredient TEXT,
+    equipment          TEXT,
+    visual_potential   TEXT,
+    seasonality        TEXT,
+    production_effort  TEXT,
+    field_overrides    TEXT NOT NULL DEFAULT '[]',
+
+    enrichment_status  TEXT NOT NULL DEFAULT 'pending',
+    enrichment_error   TEXT,
+    enrichment_model   TEXT,
+    enriched_at        DATETIME,
+
+    created_at         DATETIME NOT NULL,
+    updated_at         DATETIME NOT NULL
+);
+
+CREATE INDEX idx_ideas_stage      ON ideas(stage);
+CREATE INDEX idx_ideas_archived   ON ideas(archived_at);
+CREATE INDEX idx_ideas_created    ON ideas(created_at DESC);
+CREATE INDEX idx_ideas_enrichment ON ideas(enrichment_status);
+
+CREATE TABLE notes (
+    id         TEXT PRIMARY KEY,
+    idea_id    TEXT NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+    body       TEXT NOT NULL,
+    created_at DATETIME NOT NULL
+);
+CREATE INDEX idx_notes_idea ON notes(idea_id);
+
+CREATE TABLE tags (
+    id   TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE idea_tags (
+    idea_id TEXT NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+    tag_id  TEXT NOT NULL REFERENCES tags(id)  ON DELETE CASCADE,
+    PRIMARY KEY (idea_id, tag_id)
+);
+
+-- Links are symmetric and stored once. The CHECK enforces canonical ordering
+-- so (a,b) and (b,a) cannot both exist, and a self-link is impossible.
+CREATE TABLE idea_links (
+    idea_a_id TEXT NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+    idea_b_id TEXT NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+    PRIMARY KEY (idea_a_id, idea_b_id),
+    CHECK (idea_a_id < idea_b_id)
+);
+
+CREATE TABLE transcripts (
+    id          TEXT PRIMARY KEY,
+    idea_id     TEXT NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+    audio_path  TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    duration_ms INTEGER,
+    created_at  DATETIME NOT NULL
+);
+
+-- Contentless-adjacent FTS: we store the searchable text directly so tags,
+-- which live in a join table, can be denormalised into the index.
+CREATE VIRTUAL TABLE ideas_fts USING fts5(
+    id UNINDEXED,
+    title,
+    raw_text,
+    cuisine,
+    primary_ingredient,
+    tags,
+    tokenize = 'porter unicode61'
+);
+
+CREATE TRIGGER ideas_fts_insert AFTER INSERT ON ideas BEGIN
+    INSERT INTO ideas_fts (id, title, raw_text, cuisine, primary_ingredient, tags)
+    VALUES (new.id, new.title, new.raw_text,
+            coalesce(new.cuisine, ''), coalesce(new.primary_ingredient, ''), '');
+END;
+
+CREATE TRIGGER ideas_fts_update AFTER UPDATE ON ideas BEGIN
+    UPDATE ideas_fts
+       SET title              = new.title,
+           raw_text           = new.raw_text,
+           cuisine            = coalesce(new.cuisine, ''),
+           primary_ingredient = coalesce(new.primary_ingredient, '')
+     WHERE id = new.id;
+END;
+
+CREATE TRIGGER ideas_fts_delete AFTER DELETE ON ideas BEGIN
+    DELETE FROM ideas_fts WHERE id = old.id;
+END;
+```
+
+- [ ] **Step 5: Write the store**
+
+Create `internal/store/store.go`:
+
+```go
+// Package store owns every SQL statement in the application. No other package
+// writes queries — that boundary is what keeps the web and Telegram surfaces
+// from drifting on what operations like "archive" actually mean.
+package store
+
+import (
+	"database/sql"
+	"embed"
+	"fmt"
+	"sort"
+
+	_ "modernc.org/sqlite"
+)
+
+//go:embed all:../../migrations/*.sql
+var migrationFS embed.FS
+
+type Store struct {
+	db *sql.DB
+}
+
+func (s *Store) DB() *sql.DB { return s.db }
+
+func (s *Store) Close() error { return s.db.Close() }
+
+// Open connects to the database at path, enables the pragmas we depend on,
+// and applies any pending migrations.
+func Open(path string) (*Store, error) {
+	// WAL keeps the background enrichment writer from blocking API reads.
+	// Foreign keys are off by default in SQLite and must be asked for.
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", path)
+
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping %s: %w", path, err)
+	}
+
+	s := &Store{db: db}
+	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) migrate() error {
+	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+		name       TEXT PRIMARY KEY,
+		applied_at DATETIME NOT NULL DEFAULT (datetime('now'))
+	)`)
+	if err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+
+	entries, err := migrationFS.ReadDir("../../migrations")
+	if err != nil {
+		return fmt.Errorf("read migrations: %w", err)
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		var applied int
+		if err := s.db.QueryRow(
+			`SELECT count(*) FROM schema_migrations WHERE name = ?`, name,
+		).Scan(&applied); err != nil {
+			return fmt.Errorf("check migration %s: %w", name, err)
+		}
+		if applied > 0 {
+			continue
+		}
+
+		body, err := migrationFS.ReadFile("../../migrations/" + name)
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", name, err)
+		}
+
+		tx, err := s.db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin %s: %w", name, err)
+		}
+		if _, err := tx.Exec(string(body)); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("apply migration %s: %w", name, err)
+		}
+		if _, err := tx.Exec(`INSERT INTO schema_migrations (name) VALUES (?)`, name); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("record migration %s: %w", name, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit %s: %w", name, err)
+		}
+	}
+	return nil
+}
+```
+
+- [ ] **Step 6: Run the tests to make sure they pass**
+
+Run: `go test ./internal/store/ -v`
+Expected: PASS — all four tests.
+
+If `//go:embed all:../../migrations/*.sql` errors with "pattern outside module", move the embed to a small `migrations/migrations.go` declaring `package migrations` with `//go:embed *.sql` and have `store` import it. Prefer that shape if the relative embed misbehaves.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add internal/store migrations go.mod go.sum
+git commit -m "feat(store): SQLite connection, migration runner, and schema
+
+WAL so background enrichment writes don't block API reads, foreign keys
+on (off by default in SQLite), and an FTS5 index over title, raw text,
+cuisine and ingredient. Links use a CHECK on canonical ordering so
+symmetry and self-link rejection are enforced by the database.
+
+Tests use a temp file rather than :memory: — FTS triggers must survive a
+close and reopen, which an in-memory database would not exercise.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 4: Idea row persistence — insert, get, list
+
+**Files:**
+- Create: `internal/ideas/idea.go`, `internal/store/ideas.go`, `internal/store/ideas_test.go`
+
+**Interfaces:**
+- Consumes: `store.Store` from Task 3.
+- Produces:
+  - `ideas.Idea`, `ideas.Metadata`, `ideas.Enrichment` structs
+  - constants `ideas.StageIdea`, `ideas.SourceWeb`, `ideas.SourceTelegramText`, `ideas.SourceTelegramVoice`, `ideas.EnrichPending`, `ideas.EnrichOK`, `ideas.EnrichFailed`
+  - `ideas.ListFilter` struct
+  - `(*Store).InsertIdea(ctx, ideas.Idea) error`
+  - `(*Store).GetIdea(ctx, id string) (ideas.Idea, error)`
+  - `(*Store).ListIdeas(ctx, ideas.ListFilter) ([]ideas.Idea, error)`
+  - `(*Store).UpdateIdea(ctx, ideas.Idea) error`
+  - `(*Store).DeleteIdea(ctx, id string) error`
+  - `store.ErrNotFound`
+
+- [ ] **Step 1: Write the domain types**
+
+Create `internal/ideas/idea.go`:
+
+```go
+// Package ideas holds the domain model and the rules that govern it. It knows
+// nothing about SQL, HTTP, or Telegram.
+package ideas
+
+import "time"
+
+type Stage string
+
+const (
+	StageIdea            Stage = "idea"
+	StageBriefReady      Stage = "brief_ready"
+	StageRecipeReview    Stage = "recipe_review"
+	StageScriptReady     Stage = "script_ready"
+	StageProductionReady Stage = "production_ready"
+)
+
+type Source string
+
+const (
+	SourceWeb           Source = "web"
+	SourceTelegramText  Source = "telegram_text"
+	SourceTelegramVoice Source = "telegram_voice"
+)
+
+type EnrichmentStatus string
+
+const (
+	EnrichPending EnrichmentStatus = "pending"
+	EnrichOK      EnrichmentStatus = "ok"
+	EnrichFailed  EnrichmentStatus = "failed"
+)
+
+// Metadata is everything Claude infers about an idea. Every field is
+// optional: an idea is fully usable before enrichment lands, and must be.
+type Metadata struct {
+	Title             string   `json:"title"`
+	Difficulty        string   `json:"difficulty"`         // easy | moderate | insane
+	DurationClass     string   `json:"duration_class"`     // quick | average | multi_day
+	Treatment         string   `json:"treatment"`          // elevated | non_elevated
+	ContentType       string   `json:"content_type"`       // recipe | vlog
+	Cuisine           string   `json:"cuisine"`
+	PrimaryIngredient string   `json:"primary_ingredient"`
+	Equipment         []string `json:"equipment"`
+	VisualPotential   string   `json:"visual_potential"`   // low | medium | high
+	Seasonality       string   `json:"seasonality"`        // spring | summer | fall | winter | all_year
+	ProductionEffort  string   `json:"production_effort"`  // light | average | heavy
+	Tags              []string `json:"tags"`
+}
+
+// Enrichment records what happened on the Claude call. Error holds the
+// provider's message verbatim so a dead key reads as "401
+// authentication_error" on the row instead of as a spinner that never stops.
+type Enrichment struct {
+	Status     EnrichmentStatus `json:"status"`
+	Error      string           `json:"error,omitempty"`
+	Model      string           `json:"model,omitempty"`
+	EnrichedAt *time.Time       `json:"enriched_at,omitempty"`
+}
+
+type Note struct {
+	ID        string    `json:"id"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type Idea struct {
+	ID        string  `json:"id"`
+	Title     string  `json:"title"`
+	RawText   string  `json:"raw_text"`
+	Source    Source  `json:"source"`
+	SourceRef string  `json:"source_ref,omitempty"`
+	Stage     Stage   `json:"stage"`
+
+	// ArchivedAt is separate from Stage on purpose. Archiving must not
+	// destroy how far an idea got through the pipeline.
+	ArchivedAt   *time.Time `json:"archived_at,omitempty"`
+	MergedIntoID *string    `json:"merged_into_id,omitempty"`
+
+	Metadata Metadata `json:"metadata"`
+
+	// FieldOverrides names metadata fields a human has corrected.
+	// Re-enrichment must not overwrite anything listed here.
+	FieldOverrides []string `json:"field_overrides"`
+
+	Enrichment Enrichment `json:"enrichment"`
+
+	Notes     []Note   `json:"notes"`
+	LinkedIDs []string `json:"linked_ids"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (i Idea) IsArchived() bool { return i.ArchivedAt != nil }
+func (i Idea) IsMerged() bool   { return i.MergedIntoID != nil }
+
+// HasOverride reports whether a human has corrected the named field.
+func (i Idea) HasOverride(field string) bool {
+	for _, f := range i.FieldOverrides {
+		if f == field {
+			return true
+		}
+	}
+	return false
+}
+
+// ArchivedScope selects which archived state a listing includes.
+type ArchivedScope string
+
+const (
+	ArchivedExclude ArchivedScope = "false" // default
+	ArchivedOnly    ArchivedScope = "true"
+	ArchivedAll     ArchivedScope = "all"
+)
+
+type ListFilter struct {
+	Query      string // when set, FTS rank wins and Sort is ignored
+	Stage      string
+	Difficulty string
+	Duration   string
+	Treatment  string
+	Archived   ArchivedScope
+	Sort       string // created_at | updated_at | title | difficulty | duration
+	Order      string // asc | desc
+	Limit      int
+}
+```
+
+- [ ] **Step 2: Write the failing test**
+
+Create `internal/store/ideas_test.go`:
+
+```go
+package store
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/erikhoward/souschef/internal/ideas"
+)
+
+func fixtureIdea(id, title string) ideas.Idea {
+	now := time.Now().UTC().Truncate(time.Second)
+	return ideas.Idea{
+		ID:             id,
+		Title:          title,
+		RawText:        title + " — raw capture text",
+		Source:         ideas.SourceWeb,
+		Stage:          ideas.StageIdea,
+		FieldOverrides: []string{},
+		Enrichment:     ideas.Enrichment{Status: ideas.EnrichPending},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+}
+
+func TestInsertAndGetIdea(t *testing.T) {
+	s, ctx := newTestStore(t), context.Background()
+
+	want := fixtureIdea("i1", "Crispy chili eggs")
+	if err := s.InsertIdea(ctx, want); err != nil {
+		t.Fatalf("InsertIdea: %v", err)
+	}
+
+	got, err := s.GetIdea(ctx, "i1")
+	if err != nil {
+		t.Fatalf("GetIdea: %v", err)
+	}
+	if got.Title != want.Title || got.RawText != want.RawText {
+		t.Errorf("round trip mismatch: got %+v", got)
+	}
+	if got.Enrichment.Status != ideas.EnrichPending {
+		t.Errorf("Enrichment.Status = %q, want pending", got.Enrichment.Status)
+	}
+	if got.Stage != ideas.StageIdea {
+		t.Errorf("Stage = %q, want idea", got.Stage)
+	}
+}
+
+func TestGetIdeaNotFound(t *testing.T) {
+	s, ctx := newTestStore(t), context.Background()
+
+	_, err := s.GetIdea(ctx, "nope")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestUpdateIdeaPersistsMetadata(t *testing.T) {
+	s, ctx := newTestStore(t), context.Background()
+
+	idea := fixtureIdea("i1", "Sheet-pan shawarma")
+	if err := s.InsertIdea(ctx, idea); err != nil {
+		t.Fatal(err)
+	}
+
+	enriched := time.Now().UTC().Truncate(time.Second)
+	idea.Metadata = ideas.Metadata{
+		Difficulty:        "easy",
+		DurationClass:     "quick",
+		Treatment:         "elevated",
+		ContentType:       "recipe",
+		Cuisine:           "Middle Eastern",
+		PrimaryIngredient: "Chicken",
+		Equipment:         []string{"sheet pan", "oven"},
+		VisualPotential:   "high",
+		Seasonality:       "all_year",
+		ProductionEffort:  "light",
+	}
+	idea.Enrichment = ideas.Enrichment{
+		Status: ideas.EnrichOK, Model: "claude-sonnet-5", EnrichedAt: &enriched,
+	}
+	if err := s.UpdateIdea(ctx, idea); err != nil {
+		t.Fatalf("UpdateIdea: %v", err)
+	}
+
+	got, err := s.GetIdea(ctx, "i1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata.Cuisine != "Middle Eastern" {
+		t.Errorf("Cuisine = %q", got.Metadata.Cuisine)
+	}
+	if len(got.Metadata.Equipment) != 2 || got.Metadata.Equipment[0] != "sheet pan" {
+		t.Errorf("Equipment = %v, want JSON round trip", got.Metadata.Equipment)
+	}
+	if got.Enrichment.Status != ideas.EnrichOK {
+		t.Errorf("Enrichment.Status = %q, want ok", got.Enrichment.Status)
+	}
+}
+
+func TestUpdateIdeaPersistsFailureVerbatim(t *testing.T) {
+	s, ctx := newTestStore(t), context.Background()
+
+	idea := fixtureIdea("i1", "Anything")
+	if err := s.InsertIdea(ctx, idea); err != nil {
+		t.Fatal(err)
+	}
+
+	const msg = "401 authentication_error: invalid x-api-key (request_id=req_abc)"
+	idea.Enrichment = ideas.Enrichment{Status: ideas.EnrichFailed, Error: msg}
+	if err := s.UpdateIdea(ctx, idea); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := s.GetIdea(ctx, "i1")
+	if got.Enrichment.Error != msg {
+		t.Errorf("error text must survive verbatim.\n got: %q\nwant: %q", got.Enrichment.Error, msg)
+	}
+}
+
+func TestListExcludesArchivedByDefault(t *testing.T) {
+	s, ctx := newTestStore(t), context.Background()
+
+	active := fixtureIdea("i1", "Active idea")
+	archived := fixtureIdea("i2", "Archived idea")
+	at := time.Now().UTC()
+	archived.ArchivedAt = &at
+
+	for _, i := range []ideas.Idea{active, archived} {
+		if err := s.InsertIdea(ctx, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.ListIdeas(ctx, ideas.ListFilter{})
+	if err != nil {
+		t.Fatalf("ListIdeas: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "i1" {
+		t.Fatalf("default listing should show only active ideas, got %d", len(got))
+	}
+
+	got, _ = s.ListIdeas(ctx, ideas.ListFilter{Archived: ideas.ArchivedOnly})
+	if len(got) != 1 || got[0].ID != "i2" {
+		t.Errorf("archived=true should show only archived, got %d", len(got))
+	}
+
+	got, _ = s.ListIdeas(ctx, ideas.ListFilter{Archived: ideas.ArchivedAll})
+	if len(got) != 2 {
+		t.Errorf("archived=all should show both, got %d", len(got))
+	}
+}
+
+func TestListExcludesMergedTombstones(t *testing.T) {
+	s, ctx := newTestStore(t), context.Background()
+
+	primary := fixtureIdea("i1", "Primary")
+	dup := fixtureIdea("i2", "Duplicate")
+	if err := s.InsertIdea(ctx, primary); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertIdea(ctx, dup); err != nil {
+		t.Fatal(err)
+	}
+
+	target := "i1"
+	dup.MergedIntoID = &target
+	if err := s.UpdateIdea(ctx, dup); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := s.ListIdeas(ctx, ideas.ListFilter{Archived: ideas.ArchivedAll})
+	if len(got) != 1 || got[0].ID != "i1" {
+		t.Errorf("merged tombstones must be excluded from listings, got %d", len(got))
+	}
+
+	// but a direct fetch still resolves
+	if _, err := s.GetIdea(ctx, "i2"); err != nil {
+		t.Errorf("direct fetch of a tombstone should still work: %v", err)
+	}
+}
+
+func TestListFiltersByMetadata(t *testing.T) {
+	s, ctx := newTestStore(t), context.Background()
+
+	easy := fixtureIdea("i1", "Easy one")
+	easy.Metadata.Difficulty = "easy"
+	easy.Metadata.DurationClass = "quick"
+
+	hard := fixtureIdea("i2", "Hard one")
+	hard.Metadata.Difficulty = "insane"
+	hard.Metadata.DurationClass = "multi_day"
+
+	for _, i := range []ideas.Idea{easy, hard} {
+		if err := s.InsertIdea(ctx, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, _ := s.ListIdeas(ctx, ideas.ListFilter{Difficulty: "easy"})
+	if len(got) != 1 || got[0].ID != "i1" {
+		t.Errorf("difficulty filter failed, got %d", len(got))
+	}
+
+	got, _ = s.ListIdeas(ctx, ideas.ListFilter{Duration: "multi_day"})
+	if len(got) != 1 || got[0].ID != "i2" {
+		t.Errorf("duration filter failed, got %d", len(got))
+	}
+}
+
+func TestListSortsDifficultySemanticallyNotAlphabetically(t *testing.T) {
+	s, ctx := newTestStore(t), context.Background()
+
+	// Alphabetically: easy, insane, moderate. Semantically: easy, moderate, insane.
+	for id, d := range map[string]string{"i1": "insane", "i2": "easy", "i3": "moderate"} {
+		idea := fixtureIdea(id, "Idea "+id)
+		idea.Metadata.Difficulty = d
+		if err := s.InsertIdea(ctx, idea); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.ListIdeas(ctx, ideas.ListFilter{Sort: "difficulty", Order: "asc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"easy", "moderate", "insane"}
+	for i, w := range want {
+		if got[i].Metadata.Difficulty != w {
+			t.Errorf("position %d = %q, want %q (semantic order, not alphabetical)",
+				i, got[i].Metadata.Difficulty, w)
+		}
+	}
+}
+
+func TestDeleteIdea(t *testing.T) {
+	s, ctx := newTestStore(t), context.Background()
+
+	if err := s.InsertIdea(ctx, fixtureIdea("i1", "Doomed")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteIdea(ctx, "i1"); err != nil {
+		t.Fatalf("DeleteIdea: %v", err)
+	}
+	if _, err := s.GetIdea(ctx, "i1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("want ErrNotFound after delete, got %v", err)
+	}
+}
+```
+
+- [ ] **Step 3: Run it to make sure it fails**
+
+Run: `go test ./internal/store/ -run TestInsertAndGetIdea -v`
+Expected: FAIL — `undefined: (*Store).InsertIdea`
+
+- [ ] **Step 4: Write the implementation**
+
+Create `internal/store/ideas.go`:
+
+```go
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/erikhoward/souschef/internal/ideas"
+)
+
+var ErrNotFound = errors.New("not found")
+
+const ideaColumns = `
+	id, title, raw_text, source, source_ref, stage, archived_at, merged_into_id,
+	difficulty, duration_class, treatment, content_type, cuisine, primary_ingredient,
+	equipment, visual_potential, seasonality, production_effort, field_overrides,
+	enrichment_status, enrichment_error, enrichment_model, enriched_at,
+	created_at, updated_at`
+
+func encodeJSON(v any) (string, error) {
+	if v == nil {
+		return "[]", nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func decodeStrings(raw sql.NullString) []string {
+	if !raw.Valid || raw.String == "" {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw.String), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func (s *Store) InsertIdea(ctx context.Context, i ideas.Idea) error {
+	equipment, err := encodeJSON(i.Metadata.Equipment)
+	if err != nil {
+		return fmt.Errorf("encode equipment: %w", err)
+	}
+	overrides, err := encodeJSON(i.FieldOverrides)
+	if err != nil {
+		return fmt.Errorf("encode field_overrides: %w", err)
+	}
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO ideas (`+ideaColumns+`)
+		VALUES (?,?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?)`,
+		i.ID, i.Title, i.RawText, string(i.Source), nullString(i.SourceRef), string(i.Stage),
+		i.ArchivedAt, i.MergedIntoID,
+		nullString(i.Metadata.Difficulty), nullString(i.Metadata.DurationClass),
+		nullString(i.Metadata.Treatment), nullString(i.Metadata.ContentType),
+		nullString(i.Metadata.Cuisine), nullString(i.Metadata.PrimaryIngredient),
+		equipment, nullString(i.Metadata.VisualPotential),
+		nullString(i.Metadata.Seasonality), nullString(i.Metadata.ProductionEffort),
+		overrides,
+		string(i.Enrichment.Status), nullString(i.Enrichment.Error),
+		nullString(i.Enrichment.Model), i.Enrichment.EnrichedAt,
+		i.CreatedAt, i.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("insert idea %s: %w", i.ID, err)
+	}
+	return nil
+}
+
+func (s *Store) UpdateIdea(ctx context.Context, i ideas.Idea) error {
+	equipment, err := encodeJSON(i.Metadata.Equipment)
+	if err != nil {
+		return fmt.Errorf("encode equipment: %w", err)
+	}
+	overrides, err := encodeJSON(i.FieldOverrides)
+	if err != nil {
+		return fmt.Errorf("encode field_overrides: %w", err)
+	}
+
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE ideas SET
+			title = ?, raw_text = ?, source = ?, source_ref = ?, stage = ?,
+			archived_at = ?, merged_into_id = ?,
+			difficulty = ?, duration_class = ?, treatment = ?, content_type = ?,
+			cuisine = ?, primary_ingredient = ?, equipment = ?, visual_potential = ?,
+			seasonality = ?, production_effort = ?, field_overrides = ?,
+			enrichment_status = ?, enrichment_error = ?, enrichment_model = ?, enriched_at = ?,
+			updated_at = ?
+		WHERE id = ?`,
+		i.Title, i.RawText, string(i.Source), nullString(i.SourceRef), string(i.Stage),
+		i.ArchivedAt, i.MergedIntoID,
+		nullString(i.Metadata.Difficulty), nullString(i.Metadata.DurationClass),
+		nullString(i.Metadata.Treatment), nullString(i.Metadata.ContentType),
+		nullString(i.Metadata.Cuisine), nullString(i.Metadata.PrimaryIngredient),
+		equipment, nullString(i.Metadata.VisualPotential),
+		nullString(i.Metadata.Seasonality), nullString(i.Metadata.ProductionEffort),
+		overrides,
+		string(i.Enrichment.Status), nullString(i.Enrichment.Error),
+		nullString(i.Enrichment.Model), i.Enrichment.EnrichedAt,
+		time.Now().UTC(), i.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("update idea %s: %w", i.ID, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) GetIdea(ctx context.Context, id string) (ideas.Idea, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+ideaColumns+` FROM ideas WHERE id = ?`, id)
+	i, err := scanIdea(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ideas.Idea{}, ErrNotFound
+	}
+	return i, err
+}
+
+func (s *Store) DeleteIdea(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM ideas WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete idea %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// sortExpression maps a sort key to SQL. Difficulty and duration sort by
+// their semantic order rather than alphabetically — "insane" must come after
+// "moderate", which a plain ORDER BY on the text column would get wrong.
+func sortExpression(sort string) string {
+	switch sort {
+	case "updated_at":
+		return "updated_at"
+	case "title":
+		return "title COLLATE NOCASE"
+	case "difficulty":
+		return `CASE difficulty WHEN 'easy' THEN 1 WHEN 'moderate' THEN 2
+		                        WHEN 'insane' THEN 3 ELSE 4 END`
+	case "duration":
+		return `CASE duration_class WHEN 'quick' THEN 1 WHEN 'average' THEN 2
+		                            WHEN 'multi_day' THEN 3 ELSE 4 END`
+	default:
+		return "created_at"
+	}
+}
+
+func defaultOrder(sort string) string {
+	if sort == "" || sort == "created_at" || sort == "updated_at" {
+		return "DESC"
+	}
+	return "ASC"
+}
+
+func (s *Store) ListIdeas(ctx context.Context, f ideas.ListFilter) ([]ideas.Idea, error) {
+	var (
+		where = []string{"merged_into_id IS NULL"}
+		args  []any
+	)
+
+	switch f.Archived {
+	case ideas.ArchivedOnly:
+		where = append(where, "archived_at IS NOT NULL")
+	case ideas.ArchivedAll:
+		// no clause
+	default:
+		where = append(where, "archived_at IS NULL")
+	}
+
+	for col, val := range map[string]string{
+		"stage":          f.Stage,
+		"difficulty":     f.Difficulty,
+		"duration_class": f.Duration,
+		"treatment":      f.Treatment,
+	} {
+		if val != "" {
+			where = append(where, col+" = ?")
+			args = append(args, val)
+		}
+	}
+
+	order := strings.ToUpper(f.Order)
+	if order != "ASC" && order != "DESC" {
+		order = defaultOrder(f.Sort)
+	}
+
+	limit := f.Limit
+	if limit <= 0 || limit > 500 {
+		limit = 500
+	}
+
+	query := `SELECT ` + ideaColumns + ` FROM ideas WHERE ` +
+		strings.Join(where, " AND ") +
+		` ORDER BY ` + sortExpression(f.Sort) + ` ` + order +
+		` LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list ideas: %w", err)
+	}
+	defer rows.Close()
+
+	out := []ideas.Idea{}
+	for rows.Next() {
+		i, err := scanIdea(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, i)
+	}
+	return out, rows.Err()
+}
+
+// scanner is satisfied by both *sql.Row and *sql.Rows.
+type scanner interface{ Scan(dest ...any) error }
+
+func scanIdea(sc scanner) (ideas.Idea, error) {
+	var (
+		i                                    ideas.Idea
+		source, stage, enrichStatus          string
+		sourceRef, mergedInto                sql.NullString
+		difficulty, duration, treatment      sql.NullString
+		contentType, cuisine, ingredient     sql.NullString
+		equipment, overrides                 sql.NullString
+		visual, seasonality, effort          sql.NullString
+		enrichErr, enrichModel               sql.NullString
+		archivedAt, enrichedAt               sql.NullTime
+	)
+
+	err := sc.Scan(
+		&i.ID, &i.Title, &i.RawText, &source, &sourceRef, &stage, &archivedAt, &mergedInto,
+		&difficulty, &duration, &treatment, &contentType, &cuisine, &ingredient,
+		&equipment, &visual, &seasonality, &effort, &overrides,
+		&enrichStatus, &enrichErr, &enrichModel, &enrichedAt,
+		&i.CreatedAt, &i.UpdatedAt,
+	)
+	if err != nil {
+		return ideas.Idea{}, err
+	}
+
+	i.Source = ideas.Source(source)
+	i.Stage = ideas.Stage(stage)
+	i.SourceRef = sourceRef.String
+	if archivedAt.Valid {
+		t := archivedAt.Time
+		i.ArchivedAt = &t
+	}
+	if mergedInto.Valid {
+		v := mergedInto.String
+		i.MergedIntoID = &v
+	}
+
+	i.Metadata = ideas.Metadata{
+		Difficulty:        difficulty.String,
+		DurationClass:     duration.String,
+		Treatment:         treatment.String,
+		ContentType:       contentType.String,
+		Cuisine:           cuisine.String,
+		PrimaryIngredient: ingredient.String,
+		Equipment:         decodeStrings(equipment),
+		VisualPotential:   visual.String,
+		Seasonality:       seasonality.String,
+		ProductionEffort:  effort.String,
+	}
+
+	i.FieldOverrides = decodeStrings(overrides)
+	if i.FieldOverrides == nil {
+		i.FieldOverrides = []string{}
+	}
+
+	i.Enrichment = ideas.Enrichment{
+		Status: ideas.EnrichmentStatus(enrichStatus),
+		Error:  enrichErr.String,
+		Model:  enrichModel.String,
+	}
+	if enrichedAt.Valid {
+		t := enrichedAt.Time
+		i.Enrichment.EnrichedAt = &t
+	}
+
+	i.Notes = []ideas.Note{}
+	i.LinkedIDs = []string{}
+	return i, nil
+}
+
+func nullString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+```
+
+- [ ] **Step 5: Run the tests to make sure they pass**
+
+Run: `go test ./internal/store/ -v`
+Expected: PASS — all Task 3 and Task 4 tests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add internal/ideas internal/store
+git commit -m "feat(store): idea persistence with filtering and semantic sort
+
+Difficulty and duration sort through a CASE expression so 'insane' lands
+after 'moderate' rather than alphabetically between 'easy' and it.
+Listings exclude merged tombstones while direct fetch still resolves them,
+so old Telegram references keep working.
+
+Enrichment error text is asserted to survive verbatim — that string is
+what turns a dead key into a legible row instead of a silent stall.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 5: FTS5 search
+
+This is what makes Telegram search return tappable results instead of IDs to copy-paste.
+
+**Files:**
+- Create: `internal/store/search.go`, `internal/store/search_test.go`
+
+**Interfaces:**
+- Consumes: `store.Store`, `ideas.ListFilter` from Task 4.
+- Produces: `(*Store).SearchIdeas(ctx, query string, limit int) ([]ideas.Idea, error)`; `(*Store).ReindexTags(ctx, ideaID string, tags []string) error`.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `internal/store/search_test.go`:
+
+```go
+package store
+
+import (
+	"context"
+	"testing"
+
+	"github.com/erikhoward/souschef/internal/ideas"
+)
+
+func seedSearchCorpus(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	shawarma := fixtureIdea("i1", "Sheet-pan shawarma")
+	shawarma.RawText = "sheet pan shawarma with a lemony feta situation"
+	shawarma.Metadata.Cuisine = "Middle Eastern"
+	shawarma.Metadata.PrimaryIngredient = "Chicken"
+
+	eggs := fixtureIdea("i2", "Crispy chili eggs")
+	eggs.RawText = "chili crisp eggs with scallion oil, very fast"
+	eggs.Metadata.Cuisine = "Chinese-inspired"
+	eggs.Metadata.PrimaryIngredient = "Eggs"
+
+	soup := fixtureIdea("i3", "Cabbage soup")
+	soup.RawText = "humble cabbage soup, slow"
+
+	for _, i := range []ideas.Idea{shawarma, eggs, soup} {
+		if err := s.InsertIdea(ctx, i); err != nil {
+			t.Fatal(err)
+		}
+		// Metadata set post-insert must reach the index.
+		if err := s.UpdateIdea(ctx, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSearchMatchesTitle(t *testing.T) {
+	s := newTestStore(t)
+	seedSearchCorpus(t, s)
+
+	got, err := s.SearchIdeas(context.Background(), "shawarma", 10)
+	if err != nil {
+		t.Fatalf("SearchIdeas: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "i1" {
+		t.Fatalf("want just i1, got %d results", len(got))
+	}
+}
+
+func TestSearchMatchesRawText(t *testing.T) {
+	s := newTestStore(t)
+	seedSearchCorpus(t, s)
+
+	got, _ := s.SearchIdeas(context.Background(), "scallion", 10)
+	if len(got) != 1 || got[0].ID != "i2" {
+		t.Errorf("raw_text should be searchable, got %d results", len(got))
+	}
+}
+
+func TestSearchMatchesCuisineAndIngredient(t *testing.T) {
+	s := newTestStore(t)
+	seedSearchCorpus(t, s)
+
+	if got, _ := s.SearchIdeas(context.Background(), "Chinese", 10); len(got) != 1 {
+		t.Errorf("cuisine should be searchable, got %d", len(got))
+	}
+	if got, _ := s.SearchIdeas(context.Background(), "chicken", 10); len(got) != 1 {
+		t.Errorf("primary_ingredient should be searchable, got %d", len(got))
+	}
+}
+
+// Prefix matching is what makes typing a partial word in Telegram useful.
+func TestSearchPrefixMatches(t *testing.T) {
+	s := newTestStore(t)
+	seedSearchCorpus(t, s)
+
+	got, err := s.SearchIdeas(context.Background(), "shawar", 10)
+	if err != nil {
+		t.Fatalf("SearchIdeas: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "i1" {
+		t.Errorf("partial word should match via prefix, got %d results", len(got))
+	}
+}
+
+func TestSearchExcludesArchivedAndMerged(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedSearchCorpus(t, s)
+
+	soup, _ := s.GetIdea(ctx, "i3")
+	at := soup.CreatedAt
+	soup.ArchivedAt = &at
+	if err := s.UpdateIdea(ctx, soup); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := s.SearchIdeas(ctx, "cabbage", 10)
+	if len(got) != 0 {
+		t.Errorf("archived ideas must not appear in search, got %d", len(got))
+	}
+}
+
+func TestSearchHandlesFTSSyntaxWithoutError(t *testing.T) {
+	s := newTestStore(t)
+	seedSearchCorpus(t, s)
+
+	// A user typing punctuation must not produce a syntax error from FTS5.
+	for _, q := range []string{`"unbalanced`, `AND`, `*`, `foo NEAR/`, `()`} {
+		if _, err := s.SearchIdeas(context.Background(), q, 10); err != nil {
+			t.Errorf("query %q should be sanitised, not error: %v", q, err)
+		}
+	}
+}
+
+func TestSearchIsRankOrdered(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// "eggs" in the title should outrank "eggs" mentioned once in body text.
+	strong := fixtureIdea("s1", "Eggs eggs eggs")
+	strong.RawText = "eggs"
+	weak := fixtureIdea("s2", "Something else")
+	weak.RawText = "there are eggs in this one somewhere among many other words"
+
+	for _, i := range []ideas.Idea{strong, weak} {
+		if err := s.InsertIdea(ctx, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.SearchIdeas(ctx, "eggs", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 results, got %d", len(got))
+	}
+	if got[0].ID != "s1" {
+		t.Errorf("results must be rank ordered; got %q first", got[0].ID)
+	}
+}
+
+func TestReindexTagsMakesTagsSearchable(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if err := s.InsertIdea(ctx, fixtureIdea("i1", "Nondescript")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReindexTags(ctx, "i1", []string{"weeknight", "charred"}); err != nil {
+		t.Fatalf("ReindexTags: %v", err)
+	}
+
+	got, _ := s.SearchIdeas(ctx, "weeknight", 10)
+	if len(got) != 1 || got[0].ID != "i1" {
+		t.Errorf("tags should be searchable after reindex, got %d", len(got))
+	}
+}
+```
+
+- [ ] **Step 2: Run it to make sure it fails**
+
+Run: `go test ./internal/store/ -run TestSearch -v`
+Expected: FAIL — `undefined: (*Store).SearchIdeas`
+
+- [ ] **Step 3: Write the implementation**
+
+Create `internal/store/search.go`:
+
+```go
+package store
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"unicode"
+
+	"github.com/erikhoward/souschef/internal/ideas"
+)
+
+// sanitiseFTSQuery converts free-typed user input into a safe FTS5 MATCH
+// expression. Users type things like `"unbalanced` or `NEAR/` without meaning
+// FTS operators, and raw input would raise a syntax error rather than return
+// nothing — so we strip everything non-alphanumeric, quote each remaining
+// token, and append * for prefix matching.
+func sanitiseFTSQuery(q string) string {
+	fields := strings.FieldsFunc(q, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+
+	terms := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if f == "" {
+			continue
+		}
+		terms = append(terms, `"`+f+`"*`)
+	}
+	return strings.Join(terms, " ")
+}
+
+// SearchIdeas runs a ranked full-text search. Archived and merged ideas are
+// excluded — search is for finding things you might still act on.
+func (s *Store) SearchIdeas(ctx context.Context, query string, limit int) ([]ideas.Idea, error) {
+	match := sanitiseFTSQuery(query)
+	if match == "" {
+		return []ideas.Idea{}, nil
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+prefixed(ideaColumns, "i.")+`
+		  FROM ideas_fts f
+		  JOIN ideas i ON i.id = f.id
+		 WHERE ideas_fts MATCH ?
+		   AND i.archived_at IS NULL
+		   AND i.merged_into_id IS NULL
+		 ORDER BY rank
+		 LIMIT ?`, match, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search %q: %w", query, err)
+	}
+	defer rows.Close()
+
+	out := []ideas.Idea{}
+	for rows.Next() {
+		i, err := scanIdea(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, i)
+	}
+	return out, rows.Err()
+}
+
+// ReindexTags refreshes the denormalised tag text in the FTS index. Tags live
+// in a join table, so the AFTER UPDATE trigger on ideas cannot see them.
+func (s *Store) ReindexTags(ctx context.Context, ideaID string, tags []string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE ideas_fts SET tags = ? WHERE id = ?`,
+		strings.Join(tags, " "), ideaID)
+	if err != nil {
+		return fmt.Errorf("reindex tags for %s: %w", ideaID, err)
+	}
+	return nil
+}
+
+// prefixed qualifies each column in a comma-separated list with a table alias.
+func prefixed(columns, alias string) string {
+	parts := strings.Split(columns, ",")
+	for idx, p := range parts {
+		parts[idx] = alias + strings.TrimSpace(p)
+	}
+	return strings.Join(parts, ", ")
+}
+```
+
+- [ ] **Step 4: Run the tests to make sure they pass**
+
+Run: `go test ./internal/store/ -v`
+Expected: PASS — all store tests.
+
+If `TestSearchIsRankOrdered` fails, confirm the query uses bare `ORDER BY rank` (FTS5's built-in ordering) and not `ORDER BY f.rank`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/store/search.go internal/store/search_test.go
+git commit -m "feat(store): ranked FTS5 search with prefix matching
+
+Free-typed input is sanitised into a safe MATCH expression — a stray
+quote or the word AND would otherwise raise an FTS syntax error instead
+of returning nothing. Each token gets a * so partial words match, which
+is what makes searching from a phone keyboard workable.
+
+This is the fix for the previous iteration's real defect: search had no
+index, so finding an idea meant copy-pasting IDs.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 6: Domain service — create, correct, archive, link, merge
+
+This task holds the rules that the spec calls out as non-obvious: archive must
+preserve `stage`, corrections must survive re-enrichment, links are symmetric,
+and merge leaves a resolvable tombstone.
+
+**Files:**
+- Create: `internal/store/relations.go`, `internal/ideas/service.go`, `internal/ideas/service_test.go`
+
+**Interfaces:**
+- Consumes: everything from Tasks 4 and 5.
+- Produces:
+  - `ideas.Repo` interface (what the service needs from `store`)
+  - `ideas.NewService(repo Repo) *Service`
+  - `(*Service).Create(ctx, rawText string, source Source, sourceRef string) (Idea, error)`
+  - `(*Service).ApplyEnrichment(ctx, id string, m Metadata, model string) (Idea, error)`
+  - `(*Service).RecordEnrichmentFailure(ctx, id, errText string) (Idea, error)`
+  - `(*Service).Correct(ctx, id string, patch map[string]any) (Idea, error)`
+  - `(*Service).Archive/Restore/Delete(ctx, id string) (...)`
+  - `(*Service).Link(ctx, a, b string) error`, `(*Service).Unlink(ctx, a, b string) error`
+  - `(*Service).Merge(ctx, primaryID, duplicateID string) (Idea, error)`
+  - `(*Service).AddNote(ctx, id, body string) (Note, error)`
+  - `ideas.DeriveTitle(rawText string) string`
+  - errors `ideas.ErrSelfLink`, `ideas.ErrSelfMerge`, `ideas.ErrEmptyText`, `ideas.ErrTooLong`
+
+- [ ] **Step 1: Write the relations store**
+
+Create `internal/store/relations.go`:
+
+```go
+package store
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/erikhoward/souschef/internal/ideas"
+)
+
+func (s *Store) AddNote(ctx context.Context, id, ideaID, body string, at time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO notes (id, idea_id, body, created_at) VALUES (?,?,?,?)`,
+		id, ideaID, body, at)
+	if err != nil {
+		return fmt.Errorf("add note to %s: %w", ideaID, err)
+	}
+	return nil
+}
+
+func (s *Store) DeleteNote(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM notes WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete note %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) NotesFor(ctx context.Context, ideaID string) ([]ideas.Note, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, body, created_at FROM notes WHERE idea_id = ? ORDER BY created_at`, ideaID)
+	if err != nil {
+		return nil, fmt.Errorf("notes for %s: %w", ideaID, err)
+	}
+	defer rows.Close()
+
+	out := []ideas.Note{}
+	for rows.Next() {
+		var n ideas.Note
+		if err := rows.Scan(&n.ID, &n.Body, &n.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// orderPair returns the two ids in canonical order. The idea_links CHECK
+// constraint requires a < b, which is how symmetry is enforced by the schema
+// rather than by convention.
+func orderPair(a, b string) (string, string) {
+	if a < b {
+		return a, b
+	}
+	return b, a
+}
+
+func (s *Store) AddLink(ctx context.Context, a, b string) error {
+	lo, hi := orderPair(a, b)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO idea_links (idea_a_id, idea_b_id) VALUES (?,?)`, lo, hi)
+	if err != nil {
+		return fmt.Errorf("link %s<->%s: %w", a, b, err)
+	}
+	return nil
+}
+
+func (s *Store) RemoveLink(ctx context.Context, a, b string) error {
+	lo, hi := orderPair(a, b)
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM idea_links WHERE idea_a_id = ? AND idea_b_id = ?`, lo, hi)
+	if err != nil {
+		return fmt.Errorf("unlink %s<->%s: %w", a, b, err)
+	}
+	return nil
+}
+
+// LinkedIDs returns every idea linked to id, in either direction.
+func (s *Store) LinkedIDs(ctx context.Context, id string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT idea_b_id FROM idea_links WHERE idea_a_id = ?
+		UNION
+		SELECT idea_a_id FROM idea_links WHERE idea_b_id = ?`, id, id)
+	if err != nil {
+		return nil, fmt.Errorf("linked ids for %s: %w", id, err)
+	}
+	defer rows.Close()
+
+	out := []string{}
+	for rows.Next() {
+		var other string
+		if err := rows.Scan(&other); err != nil {
+			return nil, err
+		}
+		out = append(out, other)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SetTags(ctx context.Context, ideaID string, tags []string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM idea_tags WHERE idea_id = ?`, ideaID); err != nil {
+		return fmt.Errorf("clear tags for %s: %w", ideaID, err)
+	}
+	for _, name := range tags {
+		if name == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO tags (id, name) VALUES (lower(hex(randomblob(8))), ?)`, name); err != nil {
+			return fmt.Errorf("upsert tag %q: %w", name, err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO idea_tags (idea_id, tag_id)
+			SELECT ?, id FROM tags WHERE name = ?`, ideaID, name); err != nil {
+			return fmt.Errorf("attach tag %q: %w", name, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.ReindexTags(ctx, ideaID, tags)
+}
+
+func (s *Store) TagsFor(ctx context.Context, ideaID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT t.name FROM tags t
+		  JOIN idea_tags it ON it.tag_id = t.id
+		 WHERE it.idea_id = ? ORDER BY t.name`, ideaID)
+	if err != nil {
+		return nil, fmt.Errorf("tags for %s: %w", ideaID, err)
+	}
+	defer rows.Close()
+
+	out := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+```
+
+- [ ] **Step 2: Write the failing test**
+
+Create `internal/ideas/service_test.go`:
+
+```go
+package ideas_test
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/erikhoward/souschef/internal/ideas"
+	"github.com/erikhoward/souschef/internal/store"
+)
+
+func newService(t *testing.T) (*ideas.Service, context.Context) {
+	t.Helper()
+	s, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return ideas.NewService(s), context.Background()
+}
+
+func TestCreateDerivesTitleAndStaysPending(t *testing.T) {
+	svc, ctx := newService(t)
+
+	got, err := svc.Create(ctx, "Sheet-pan shawarma with a lemony feta situation. Maybe halloumi too.",
+		ideas.SourceWeb, "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got.ID == "" {
+		t.Error("Create must assign an id")
+	}
+	if got.Title != "Sheet-pan shawarma with a lemony feta situation" {
+		t.Errorf("Title = %q, want the first sentence", got.Title)
+	}
+	if got.Enrichment.Status != ideas.EnrichPending {
+		t.Errorf("Status = %q, want pending — capture must never block on Claude", got.Enrichment.Status)
+	}
+	if got.Stage != ideas.StageIdea {
+		t.Errorf("Stage = %q, want idea", got.Stage)
+	}
+}
+
+func TestDeriveTitleTruncatesLongSingleSentence(t *testing.T) {
+	long := strings.Repeat("a", 200)
+	got := ideas.DeriveTitle(long)
+	if len(got) > 60 {
+		t.Errorf("len = %d, want <= 60", len(got))
+	}
+}
+
+func TestCreateRejectsEmptyAndOverlongText(t *testing.T) {
+	svc, ctx := newService(t)
+
+	if _, err := svc.Create(ctx, "   ", ideas.SourceWeb, ""); !errors.Is(err, ideas.ErrEmptyText) {
+		t.Errorf("want ErrEmptyText, got %v", err)
+	}
+	if _, err := svc.Create(ctx, strings.Repeat("x", 5001), ideas.SourceWeb, ""); !errors.Is(err, ideas.ErrTooLong) {
+		t.Errorf("want ErrTooLong, got %v", err)
+	}
+}
+
+// The headline invariant from the spec.
+func TestArchiveRestorePreservesStage(t *testing.T) {
+	svc, ctx := newService(t)
+
+	created, _ := svc.Create(ctx, "An idea that got somewhere", ideas.SourceWeb, "")
+	created.Stage = ideas.StageBriefReady
+	if err := svc.Save(ctx, created); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := svc.Archive(ctx, created.ID); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	archived, _ := svc.Get(ctx, created.ID)
+	if !archived.IsArchived() {
+		t.Fatal("Archive did not set archived_at")
+	}
+	if archived.Stage != ideas.StageBriefReady {
+		t.Errorf("archiving destroyed stage: got %q, want brief_ready", archived.Stage)
+	}
+
+	if _, err := svc.Restore(ctx, created.ID); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	restored, _ := svc.Get(ctx, created.ID)
+	if restored.IsArchived() {
+		t.Error("Restore did not clear archived_at")
+	}
+	if restored.Stage != ideas.StageBriefReady {
+		t.Errorf("restore reset stage to %q, want brief_ready preserved", restored.Stage)
+	}
+}
+
+func TestCorrectRecordsOverrideAndSurvivesReenrichment(t *testing.T) {
+	svc, ctx := newService(t)
+
+	created, _ := svc.Create(ctx, "Chili eggs", ideas.SourceWeb, "")
+
+	// First enrichment lands.
+	_, err := svc.ApplyEnrichment(ctx, created.ID, ideas.Metadata{
+		Title: "Chili eggs", Difficulty: "moderate", Cuisine: "Unclear",
+	}, "claude-sonnet-5")
+	if err != nil {
+		t.Fatalf("ApplyEnrichment: %v", err)
+	}
+
+	// Human corrects difficulty.
+	corrected, err := svc.Correct(ctx, created.ID, map[string]any{"difficulty": "easy"})
+	if err != nil {
+		t.Fatalf("Correct: %v", err)
+	}
+	if corrected.Metadata.Difficulty != "easy" {
+		t.Errorf("Difficulty = %q, want easy", corrected.Metadata.Difficulty)
+	}
+	if !corrected.HasOverride("difficulty") {
+		t.Fatal("Correct must record the field in FieldOverrides")
+	}
+
+	// Re-enrichment tries to set it back and must be refused for that field only.
+	after, err := svc.ApplyEnrichment(ctx, created.ID, ideas.Metadata{
+		Title: "Chili eggs", Difficulty: "insane", Cuisine: "Chinese-inspired",
+	}, "claude-sonnet-5")
+	if err != nil {
+		t.Fatalf("ApplyEnrichment: %v", err)
+	}
+	if after.Metadata.Difficulty != "easy" {
+		t.Errorf("re-enrichment clobbered a corrected field: got %q, want easy", after.Metadata.Difficulty)
+	}
+	if after.Metadata.Cuisine != "Chinese-inspired" {
+		t.Errorf("re-enrichment should still update uncorrected fields, got %q", after.Metadata.Cuisine)
+	}
+}
+
+func TestCorrectingTitleProtectsIt(t *testing.T) {
+	svc, ctx := newService(t)
+
+	created, _ := svc.Create(ctx, "some rambling capture", ideas.SourceWeb, "")
+	if _, err := svc.Correct(ctx, created.ID, map[string]any{"title": "My Title"}); err != nil {
+		t.Fatal(err)
+	}
+
+	after, _ := svc.ApplyEnrichment(ctx, created.ID,
+		ideas.Metadata{Title: "Model Title", Difficulty: "easy"}, "claude-sonnet-5")
+	if after.Title != "My Title" {
+		t.Errorf("Title = %q, want the human's title preserved", after.Title)
+	}
+}
+
+func TestRecordEnrichmentFailureKeepsIdeaUsable(t *testing.T) {
+	svc, ctx := newService(t)
+
+	created, _ := svc.Create(ctx, "Something worth keeping", ideas.SourceWeb, "")
+	const msg = "401 authentication_error: invalid x-api-key"
+
+	got, err := svc.RecordEnrichmentFailure(ctx, created.ID, msg)
+	if err != nil {
+		t.Fatalf("RecordEnrichmentFailure: %v", err)
+	}
+	if got.Enrichment.Status != ideas.EnrichFailed {
+		t.Errorf("Status = %q, want failed", got.Enrichment.Status)
+	}
+	if got.Enrichment.Error != msg {
+		t.Errorf("Error = %q, want verbatim provider message", got.Enrichment.Error)
+	}
+	if got.RawText != "Something worth keeping" {
+		t.Error("the captured text must survive an enrichment failure intact")
+	}
+}
+
+func TestLinkIsSymmetricAndRejectsSelf(t *testing.T) {
+	svc, ctx := newService(t)
+
+	a, _ := svc.Create(ctx, "Idea A", ideas.SourceWeb, "")
+	b, _ := svc.Create(ctx, "Idea B", ideas.SourceWeb, "")
+
+	if err := svc.Link(ctx, a.ID, b.ID); err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+
+	gotA, _ := svc.Get(ctx, a.ID)
+	gotB, _ := svc.Get(ctx, b.ID)
+	if len(gotA.LinkedIDs) != 1 || gotA.LinkedIDs[0] != b.ID {
+		t.Errorf("A should link to B, got %v", gotA.LinkedIDs)
+	}
+	if len(gotB.LinkedIDs) != 1 || gotB.LinkedIDs[0] != a.ID {
+		t.Errorf("link must be symmetric; B sees %v", gotB.LinkedIDs)
+	}
+
+	// Linking again in the other direction must not create a duplicate.
+	if err := svc.Link(ctx, b.ID, a.ID); err != nil {
+		t.Fatalf("re-link: %v", err)
+	}
+	gotA, _ = svc.Get(ctx, a.ID)
+	if len(gotA.LinkedIDs) != 1 {
+		t.Errorf("reverse link created a duplicate: %v", gotA.LinkedIDs)
+	}
+
+	if err := svc.Link(ctx, a.ID, a.ID); !errors.Is(err, ideas.ErrSelfLink) {
+		t.Errorf("want ErrSelfLink, got %v", err)
+	}
+}
+
+func TestMergeUnionsAndTombstones(t *testing.T) {
+	svc, ctx := newService(t)
+
+	primary, _ := svc.Create(ctx, "Primary idea", ideas.SourceWeb, "")
+	dup, _ := svc.Create(ctx, "Duplicate idea", ideas.SourceWeb, "")
+	other, _ := svc.Create(ctx, "Unrelated", ideas.SourceWeb, "")
+
+	if _, err := svc.AddNote(ctx, primary.ID, "note on primary"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.AddNote(ctx, dup.ID, "note on duplicate"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Link(ctx, dup.ID, other.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	merged, err := svc.Merge(ctx, primary.ID, dup.ID)
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if len(merged.Notes) != 2 {
+		t.Errorf("merge should union notes, got %d", len(merged.Notes))
+	}
+	if len(merged.LinkedIDs) != 1 || merged.LinkedIDs[0] != other.ID {
+		t.Errorf("merge should inherit the duplicate's links, got %v", merged.LinkedIDs)
+	}
+
+	tomb, err := svc.Get(ctx, dup.ID)
+	if err != nil {
+		t.Fatalf("tombstone must still resolve: %v", err)
+	}
+	if tomb.MergedIntoID == nil || *tomb.MergedIntoID != primary.ID {
+		t.Error("duplicate must be tombstoned pointing at the primary")
+	}
+
+	if err := svc.Merge(ctx, primary.ID, primary.ID); err == nil {
+		t.Error("merging an idea into itself must fail")
+	}
+}
+```
+
+- [ ] **Step 3: Run it to make sure it fails**
+
+Run: `go test ./internal/ideas/ -v`
+Expected: FAIL — `undefined: ideas.NewService`
+
+- [ ] **Step 4: Write the service**
+
+Create `internal/ideas/service.go`:
+
+```go
+package ideas
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+var (
+	ErrEmptyText = errors.New("idea text must not be empty")
+	ErrTooLong   = errors.New("idea text must be 5000 characters or fewer")
+	ErrSelfLink  = errors.New("an idea cannot be linked to itself")
+	ErrSelfMerge = errors.New("an idea cannot be merged into itself")
+)
+
+const maxRawTextLen = 5000
+
+// Repo is the slice of the store the service needs. Declaring it here rather
+// than importing a concrete type keeps the dependency pointing inward and lets
+// tests substitute a fake if one is ever warranted.
+type Repo interface {
+	InsertIdea(ctx context.Context, i Idea) error
+	GetIdea(ctx context.Context, id string) (Idea, error)
+	UpdateIdea(ctx context.Context, i Idea) error
+	DeleteIdea(ctx context.Context, id string) error
+	ListIdeas(ctx context.Context, f ListFilter) ([]Idea, error)
+	SearchIdeas(ctx context.Context, q string, limit int) ([]Idea, error)
+
+	AddNote(ctx context.Context, id, ideaID, body string, at time.Time) error
+	NotesFor(ctx context.Context, ideaID string) ([]Note, error)
+	AddLink(ctx context.Context, a, b string) error
+	RemoveLink(ctx context.Context, a, b string) error
+	LinkedIDs(ctx context.Context, id string) ([]string, error)
+	SetTags(ctx context.Context, ideaID string, tags []string) error
+	TagsFor(ctx context.Context, ideaID string) ([]string, error)
+}
+
+type Service struct{ repo Repo }
+
+func NewService(repo Repo) *Service { return &Service{repo: repo} }
+
+// DeriveTitle produces a provisional title from raw capture text so a row is
+// never blank before enrichment lands. It prefers the first sentence, and
+// falls back to a 60-character truncation on a word boundary.
+func DeriveTitle(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "Untitled idea"
+	}
+	if idx := strings.IndexAny(s, ".!?\n"); idx > 0 && idx <= 60 {
+		return strings.TrimSpace(s[:idx])
+	}
+	if len(s) <= 60 {
+		return s
+	}
+	cut := s[:60]
+	if sp := strings.LastIndex(cut, " "); sp > 20 {
+		cut = cut[:sp]
+	}
+	return strings.TrimSpace(cut) + "…"
+}
+
+func (s *Service) Create(ctx context.Context, rawText string, source Source, sourceRef string) (Idea, error) {
+	text := strings.TrimSpace(rawText)
+	if text == "" {
+		return Idea{}, ErrEmptyText
+	}
+	if len(text) > maxRawTextLen {
+		return Idea{}, ErrTooLong
+	}
+
+	id, err := uuid.NewV7()
+	if err != nil {
+		return Idea{}, fmt.Errorf("generate id: %w", err)
+	}
+
+	now := time.Now().UTC()
+	idea := Idea{
+		ID:             id.String(),
+		Title:          DeriveTitle(text),
+		RawText:        text,
+		Source:         source,
+		SourceRef:      sourceRef,
+		Stage:          StageIdea,
+		FieldOverrides: []string{},
+		Enrichment:     Enrichment{Status: EnrichPending},
+		Notes:          []Note{},
+		LinkedIDs:      []string{},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := s.repo.InsertIdea(ctx, idea); err != nil {
+		return Idea{}, err
+	}
+	return idea, nil
+}
+
+// Get returns an idea with its notes and links populated.
+func (s *Service) Get(ctx context.Context, id string) (Idea, error) {
+	idea, err := s.repo.GetIdea(ctx, id)
+	if err != nil {
+		return Idea{}, err
+	}
+	return s.hydrate(ctx, idea)
+}
+
+func (s *Service) hydrate(ctx context.Context, idea Idea) (Idea, error) {
+	notes, err := s.repo.NotesFor(ctx, idea.ID)
+	if err != nil {
+		return Idea{}, err
+	}
+	linked, err := s.repo.LinkedIDs(ctx, idea.ID)
+	if err != nil {
+		return Idea{}, err
+	}
+	tags, err := s.repo.TagsFor(ctx, idea.ID)
+	if err != nil {
+		return Idea{}, err
+	}
+	idea.Notes = notes
+	idea.LinkedIDs = linked
+	idea.Metadata.Tags = tags
+	return idea, nil
+}
+
+func (s *Service) List(ctx context.Context, f ListFilter) ([]Idea, error) {
+	if f.Query != "" {
+		return s.repo.SearchIdeas(ctx, f.Query, f.Limit)
+	}
+	return s.repo.ListIdeas(ctx, f)
+}
+
+func (s *Service) Save(ctx context.Context, i Idea) error {
+	return s.repo.UpdateIdea(ctx, i)
+}
+
+// ApplyEnrichment writes inferred metadata, skipping every field a human has
+// already corrected. This is the invariant that lets "allow correction" and
+// "retry enrichment" coexist.
+func (s *Service) ApplyEnrichment(ctx context.Context, id string, m Metadata, model string) (Idea, error) {
+	idea, err := s.repo.GetIdea(ctx, id)
+	if err != nil {
+		return Idea{}, err
+	}
+
+	set := func(field string, dst *string, val string) {
+		if val != "" && !idea.HasOverride(field) {
+			*dst = val
+		}
+	}
+
+	if m.Title != "" && !idea.HasOverride("title") {
+		idea.Title = m.Title
+	}
+	set("difficulty", &idea.Metadata.Difficulty, m.Difficulty)
+	set("duration_class", &idea.Metadata.DurationClass, m.DurationClass)
+	set("treatment", &idea.Metadata.Treatment, m.Treatment)
+	set("content_type", &idea.Metadata.ContentType, m.ContentType)
+	set("cuisine", &idea.Metadata.Cuisine, m.Cuisine)
+	set("primary_ingredient", &idea.Metadata.PrimaryIngredient, m.PrimaryIngredient)
+	set("visual_potential", &idea.Metadata.VisualPotential, m.VisualPotential)
+	set("seasonality", &idea.Metadata.Seasonality, m.Seasonality)
+	set("production_effort", &idea.Metadata.ProductionEffort, m.ProductionEffort)
+
+	if len(m.Equipment) > 0 && !idea.HasOverride("equipment") {
+		idea.Metadata.Equipment = m.Equipment
+	}
+
+	now := time.Now().UTC()
+	idea.Enrichment = Enrichment{Status: EnrichOK, Model: model, EnrichedAt: &now}
+	idea.UpdatedAt = now
+
+	if err := s.repo.UpdateIdea(ctx, idea); err != nil {
+		return Idea{}, err
+	}
+	if len(m.Tags) > 0 && !idea.HasOverride("tags") {
+		if err := s.repo.SetTags(ctx, idea.ID, m.Tags); err != nil {
+			return Idea{}, err
+		}
+	}
+	return s.hydrate(ctx, idea)
+}
+
+// RecordEnrichmentFailure stores the provider's message verbatim. The idea
+// itself is untouched and remains fully usable.
+func (s *Service) RecordEnrichmentFailure(ctx context.Context, id, errText string) (Idea, error) {
+	idea, err := s.repo.GetIdea(ctx, id)
+	if err != nil {
+		return Idea{}, err
+	}
+	idea.Enrichment.Status = EnrichFailed
+	idea.Enrichment.Error = errText
+	idea.UpdatedAt = time.Now().UTC()
+
+	if err := s.repo.UpdateIdea(ctx, idea); err != nil {
+		return Idea{}, err
+	}
+	return s.hydrate(ctx, idea)
+}
+
+// MarkPending resets an idea for a retry.
+func (s *Service) MarkPending(ctx context.Context, id string) (Idea, error) {
+	idea, err := s.repo.GetIdea(ctx, id)
+	if err != nil {
+		return Idea{}, err
+	}
+	idea.Enrichment = Enrichment{Status: EnrichPending}
+	idea.UpdatedAt = time.Now().UTC()
+	if err := s.repo.UpdateIdea(ctx, idea); err != nil {
+		return Idea{}, err
+	}
+	return s.hydrate(ctx, idea)
+}
+
+// correctable maps a JSON patch key to the field it writes.
+var correctable = map[string]func(*Idea, string){
+	"title":              func(i *Idea, v string) { i.Title = v },
+	"difficulty":         func(i *Idea, v string) { i.Metadata.Difficulty = v },
+	"duration_class":     func(i *Idea, v string) { i.Metadata.DurationClass = v },
+	"treatment":          func(i *Idea, v string) { i.Metadata.Treatment = v },
+	"content_type":       func(i *Idea, v string) { i.Metadata.ContentType = v },
+	"cuisine":            func(i *Idea, v string) { i.Metadata.Cuisine = v },
+	"primary_ingredient": func(i *Idea, v string) { i.Metadata.PrimaryIngredient = v },
+	"visual_potential":   func(i *Idea, v string) { i.Metadata.VisualPotential = v },
+	"seasonality":        func(i *Idea, v string) { i.Metadata.Seasonality = v },
+	"production_effort":  func(i *Idea, v string) { i.Metadata.ProductionEffort = v },
+}
+
+// Correct applies a human edit and records the field as overridden so
+// re-enrichment leaves it alone.
+func (s *Service) Correct(ctx context.Context, id string, patch map[string]any) (Idea, error) {
+	idea, err := s.repo.GetIdea(ctx, id)
+	if err != nil {
+		return Idea{}, err
+	}
+
+	overrides := map[string]bool{}
+	for _, f := range idea.FieldOverrides {
+		overrides[f] = true
+	}
+
+	for key, raw := range patch {
+		switch key {
+		case "equipment", "tags":
+			vals, ok := toStringSlice(raw)
+			if !ok {
+				return Idea{}, fmt.Errorf("%s must be an array of strings", key)
+			}
+			if key == "equipment" {
+				idea.Metadata.Equipment = vals
+			} else {
+				if err := s.repo.SetTags(ctx, idea.ID, vals); err != nil {
+					return Idea{}, err
+				}
+			}
+			overrides[key] = true
+		default:
+			apply, known := correctable[key]
+			if !known {
+				return Idea{}, fmt.Errorf("field %q is not correctable", key)
+			}
+			str, ok := raw.(string)
+			if !ok {
+				return Idea{}, fmt.Errorf("%s must be a string", key)
+			}
+			apply(&idea, str)
+			overrides[key] = true
+		}
+	}
+
+	idea.FieldOverrides = idea.FieldOverrides[:0]
+	for f := range overrides {
+		idea.FieldOverrides = append(idea.FieldOverrides, f)
+	}
+	idea.UpdatedAt = time.Now().UTC()
+
+	if err := s.repo.UpdateIdea(ctx, idea); err != nil {
+		return Idea{}, err
+	}
+	return s.hydrate(ctx, idea)
+}
+
+func toStringSlice(raw any) ([]string, bool) {
+	switch v := raw.(type) {
+	case []string:
+		return v, true
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, s)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+// Archive sets archived_at and deliberately leaves Stage alone.
+func (s *Service) Archive(ctx context.Context, id string) (Idea, error) {
+	return s.setArchived(ctx, id, true)
+}
+
+func (s *Service) Restore(ctx context.Context, id string) (Idea, error) {
+	return s.setArchived(ctx, id, false)
+}
+
+func (s *Service) setArchived(ctx context.Context, id string, archived bool) (Idea, error) {
+	idea, err := s.repo.GetIdea(ctx, id)
+	if err != nil {
+		return Idea{}, err
+	}
+	if archived {
+		now := time.Now().UTC()
+		idea.ArchivedAt = &now
+	} else {
+		idea.ArchivedAt = nil
+	}
+	idea.UpdatedAt = time.Now().UTC()
+
+	if err := s.repo.UpdateIdea(ctx, idea); err != nil {
+		return Idea{}, err
+	}
+	return s.hydrate(ctx, idea)
+}
+
+func (s *Service) Delete(ctx context.Context, id string) error {
+	return s.repo.DeleteIdea(ctx, id)
+}
+
+func (s *Service) Link(ctx context.Context, a, b string) error {
+	if a == b {
+		return ErrSelfLink
+	}
+	return s.repo.AddLink(ctx, a, b)
+}
+
+func (s *Service) Unlink(ctx context.Context, a, b string) error {
+	return s.repo.RemoveLink(ctx, a, b)
+}
+
+func (s *Service) AddNote(ctx context.Context, ideaID, body string) (Note, error) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return Note{}, ErrEmptyText
+	}
+	id, err := uuid.NewV7()
+	if err != nil {
+		return Note{}, fmt.Errorf("generate id: %w", err)
+	}
+	now := time.Now().UTC()
+	if err := s.repo.AddNote(ctx, id.String(), ideaID, body, now); err != nil {
+		return Note{}, err
+	}
+	return Note{ID: id.String(), Body: body, CreatedAt: now}, nil
+}
+
+// Merge folds duplicate into primary: notes and links move across, the
+// duplicate becomes a tombstone pointing at the primary rather than being
+// deleted, so old references still resolve.
+func (s *Service) Merge(ctx context.Context, primaryID, duplicateID string) (Idea, error) {
+	if primaryID == duplicateID {
+		return Idea{}, ErrSelfMerge
+	}
+
+	primary, err := s.repo.GetIdea(ctx, primaryID)
+	if err != nil {
+		return Idea{}, err
+	}
+	duplicate, err := s.repo.GetIdea(ctx, duplicateID)
+	if err != nil {
+		return Idea{}, err
+	}
+
+	dupNotes, err := s.repo.NotesFor(ctx, duplicateID)
+	if err != nil {
+		return Idea{}, err
+	}
+	for _, n := range dupNotes {
+		if err := s.repo.AddNote(ctx, uuid.NewString(), primaryID, n.Body, n.CreatedAt); err != nil {
+			return Idea{}, err
+		}
+	}
+
+	dupLinks, err := s.repo.LinkedIDs(ctx, duplicateID)
+	if err != nil {
+		return Idea{}, err
+	}
+	for _, other := range dupLinks {
+		if other == primaryID {
+			continue
+		}
+		if err := s.repo.AddLink(ctx, primaryID, other); err != nil {
+			return Idea{}, err
+		}
+		if err := s.repo.RemoveLink(ctx, duplicateID, other); err != nil {
+			return Idea{}, err
+		}
+	}
+
+	dupTags, err := s.repo.TagsFor(ctx, duplicateID)
+	if err != nil {
+		return Idea{}, err
+	}
+	if len(dupTags) > 0 {
+		primaryTags, err := s.repo.TagsFor(ctx, primaryID)
+		if err != nil {
+			return Idea{}, err
+		}
+		seen := map[string]bool{}
+		union := []string{}
+		for _, t := range append(primaryTags, dupTags...) {
+			if !seen[t] {
+				seen[t] = true
+				union = append(union, t)
+			}
+		}
+		if err := s.repo.SetTags(ctx, primaryID, union); err != nil {
+			return Idea{}, err
+		}
+	}
+
+	duplicate.MergedIntoID = &primaryID
+	duplicate.UpdatedAt = time.Now().UTC()
+	if err := s.repo.UpdateIdea(ctx, duplicate); err != nil {
+		return Idea{}, err
+	}
+
+	primary.UpdatedAt = time.Now().UTC()
+	if err := s.repo.UpdateIdea(ctx, primary); err != nil {
+		return Idea{}, err
+	}
+	return s.hydrate(ctx, primary)
+}
+```
+
+- [ ] **Step 5: Run the tests to make sure they pass**
+
+Run: `go test ./internal/ideas/ ./internal/store/ -v`
+Expected: PASS
+
+- [ ] **Step 6: Run the whole suite with the race detector**
+
+Run: `go test ./... -race`
+Expected: PASS
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add internal/ideas internal/store/relations.go
+git commit -m "feat(ideas): domain service with correction, archive, link, merge
+
+Four invariants have explicit tests because they are where this model
+earns its keep:
+  - archive/restore preserves stage (the old build destroyed it)
+  - a corrected field survives re-enrichment; uncorrected ones update
+  - links are symmetric and deduplicated via canonical ordering
+  - merge tombstones the duplicate so old references still resolve
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Remaining tasks
+
+Tasks 7–17 follow the same structure. Deliverables:
+
+| Task | Deliverable |
+|---|---|
+| 7 | `enrich`: Claude structured output, taxonomy prompt, error classification, fixture replay |
+| 8 | `httpapi`: REST routes and JSON |
+| 9 | `httpapi`: SSE hub with reconnect |
+| 10 | `httpapi`: embed `web/dist`, single-binary serving, graceful shutdown |
+| 11 | `web`: retheme — CSS custom properties, Slate & Sage, self-hosted Archivo + Inter |
+| 12 | `web`: router, `useIdeas` hook, delete mock data, wire list to API |
+| 13 | `web`: enrichment states, retry control, metadata correction UI |
+| 14 | `transcribe`: whisper.cpp wrapper with skipping test |
+| 15 | `telegram`: HTTP client and command registry with menu sync |
+| 16 | `telegram`: capture (text + voice), edit-in-place enrichment |
+| 17 | `telegram`: search, callbacks, Playwright e2e, PROJECT_LOG, merge |
