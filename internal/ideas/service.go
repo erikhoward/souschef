@@ -33,11 +33,14 @@ type Repo interface {
 
 	AddNote(ctx context.Context, id, ideaID, body string, at time.Time) error
 	NotesFor(ctx context.Context, ideaID string) ([]Note, error)
+	NotesForMany(ctx context.Context, ideaIDs []string) (map[string][]Note, error)
 	AddLink(ctx context.Context, a, b string) error
 	RemoveLink(ctx context.Context, a, b string) error
 	LinkedIDs(ctx context.Context, id string) ([]string, error)
+	LinkedIDsForMany(ctx context.Context, ideaIDs []string) (map[string][]string, error)
 	SetTags(ctx context.Context, ideaID string, tags []string) error
 	TagsFor(ctx context.Context, ideaID string) ([]string, error)
+	TagsForMany(ctx context.Context, ideaIDs []string) (map[string][]string, error)
 }
 
 type Service struct{ repo Repo }
@@ -162,11 +165,71 @@ func (s *Service) hydrate(ctx context.Context, idea Idea) (Idea, error) {
 	return idea, nil
 }
 
+// List returns ideas with notes, links, and tags populated, same as Get.
+// The inspector renders straight from this list (there is no separate
+// per-idea fetch on selection), so any of the three going unhydrated here
+// reads to a user as data loss — a note or tag they saved appears to
+// vanish on the next page load.
 func (s *Service) List(ctx context.Context, f ListFilter) ([]Idea, error) {
+	var (
+		out []Idea
+		err error
+	)
 	if f.Query != "" {
-		return s.repo.SearchIdeas(ctx, f.Query, f.Limit)
+		out, err = s.repo.SearchIdeas(ctx, f.Query, f.Limit)
+	} else {
+		out, err = s.repo.ListIdeas(ctx, f)
 	}
-	return s.repo.ListIdeas(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	return s.hydrateMany(ctx, out)
+}
+
+// hydrateMany fills in notes, links, and tags for a whole list result in
+// three queries total rather than three per idea — the per-idea Repo
+// methods (NotesFor etc.) would mean up to 1500 queries for a full 500-idea
+// page. Every idea comes back with non-nil Notes, LinkedIDs, and
+// Metadata.Tags even when it has none, matching the invariant the rest of
+// the API relies on: the frontend maps over these fields unguarded.
+func (s *Service) hydrateMany(ctx context.Context, list []Idea) ([]Idea, error) {
+	if len(list) == 0 {
+		return list, nil
+	}
+
+	ids := make([]string, len(list))
+	for i, idea := range list {
+		ids[i] = idea.ID
+	}
+
+	notes, err := s.repo.NotesForMany(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	linked, err := s.repo.LinkedIDsForMany(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	tags, err := s.repo.TagsForMany(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range list {
+		list[i].Notes = notes[list[i].ID]
+		if list[i].Notes == nil {
+			list[i].Notes = []Note{}
+		}
+		list[i].LinkedIDs = linked[list[i].ID]
+		if list[i].LinkedIDs == nil {
+			list[i].LinkedIDs = []string{}
+		}
+		list[i].Metadata.Tags = tags[list[i].ID]
+		if list[i].Metadata.Tags == nil {
+			list[i].Metadata.Tags = []string{}
+		}
+	}
+	return list, nil
 }
 
 func (s *Service) Save(ctx context.Context, i Idea) error {

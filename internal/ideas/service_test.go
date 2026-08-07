@@ -232,6 +232,194 @@ func TestLinkIsSymmetricAndRejectsSelf(t *testing.T) {
 	}
 }
 
+// List renders straight into the inspector with no separate per-idea
+// fetch on selection — so if List doesn't hydrate the same way Get does,
+// a saved note/link/tag correctly persists in the database but appears to
+// have vanished the next time the list loads. This must fail against the
+// pre-fix List (which just returned s.repo.ListIdeas(ctx, f) verbatim).
+func TestListHydratesNotesLinksAndTags(t *testing.T) {
+	svc, ctx := newService(t)
+
+	a, err := svc.Create(ctx, "Idea with relations", ideas.SourceWeb, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := svc.Create(ctx, "Idea B", ideas.SourceWeb, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := svc.AddNote(ctx, a.ID, "a note worth keeping"); err != nil {
+		t.Fatalf("AddNote: %v", err)
+	}
+	if err := svc.Link(ctx, a.ID, b.ID); err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if _, err := svc.Correct(ctx, a.ID, map[string]any{"tags": []string{"weeknight", "spicy"}}); err != nil {
+		t.Fatalf("Correct tags: %v", err)
+	}
+
+	list, err := svc.List(ctx, ideas.ListFilter{})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	var got *ideas.Idea
+	for i := range list {
+		if list[i].ID == a.ID {
+			got = &list[i]
+		}
+	}
+	if got == nil {
+		t.Fatal("List did not return idea A at all")
+	}
+
+	if len(got.Notes) != 1 || got.Notes[0].Body != "a note worth keeping" {
+		t.Errorf("List did not hydrate notes, got %#v", got.Notes)
+	}
+	if len(got.LinkedIDs) != 1 || got.LinkedIDs[0] != b.ID {
+		t.Errorf("List did not hydrate links, got %#v", got.LinkedIDs)
+	}
+	if len(got.Metadata.Tags) != 2 {
+		t.Errorf("List did not hydrate tags, got %#v", got.Metadata.Tags)
+	}
+}
+
+// The main risk in batching relations for a whole list is a fan-out bug:
+// row N's relations attached to idea M instead. Three ideas, each with its
+// own distinct note, its own distinct tag, and a link only between two of
+// them, is enough that any cross-wiring in the batched queries produces a
+// visible, specific mismatch rather than an accidental pass.
+func TestListDoesNotCrossWireRelationsBetweenIdeas(t *testing.T) {
+	svc, ctx := newService(t)
+
+	x, err := svc.Create(ctx, "Idea X", ideas.SourceWeb, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	y, err := svc.Create(ctx, "Idea Y", ideas.SourceWeb, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	z, err := svc.Create(ctx, "Idea Z", ideas.SourceWeb, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := svc.AddNote(ctx, x.ID, "note for x"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.AddNote(ctx, y.ID, "note for y"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.AddNote(ctx, z.ID, "note for z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Link(ctx, x.ID, y.ID); err != nil {
+		t.Fatal(err) // z is deliberately left unlinked
+	}
+	if _, err := svc.Correct(ctx, x.ID, map[string]any{"tags": []string{"tag-x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Correct(ctx, y.ID, map[string]any{"tags": []string{"tag-y"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Correct(ctx, z.ID, map[string]any{"tags": []string{"tag-z"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := svc.List(ctx, ideas.ListFilter{})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	byID := map[string]ideas.Idea{}
+	for _, i := range list {
+		byID[i.ID] = i
+	}
+
+	cases := []struct {
+		id       string
+		wantNote string
+		wantTag  string
+		wantLink []string
+	}{
+		{x.ID, "note for x", "tag-x", []string{y.ID}},
+		{y.ID, "note for y", "tag-y", []string{x.ID}},
+		{z.ID, "note for z", "tag-z", nil},
+	}
+	for _, c := range cases {
+		got := byID[c.id]
+		if len(got.Notes) != 1 || got.Notes[0].Body != c.wantNote {
+			t.Errorf("idea %s: Notes = %#v, want exactly [%q]", c.id, got.Notes, c.wantNote)
+		}
+		if len(got.Metadata.Tags) != 1 || got.Metadata.Tags[0] != c.wantTag {
+			t.Errorf("idea %s: Tags = %#v, want exactly [%q]", c.id, got.Metadata.Tags, c.wantTag)
+		}
+		if len(got.LinkedIDs) != len(c.wantLink) {
+			t.Errorf("idea %s: LinkedIDs = %#v, want %#v", c.id, got.LinkedIDs, c.wantLink)
+			continue
+		}
+		for _, want := range c.wantLink {
+			found := false
+			for _, l := range got.LinkedIDs {
+				if l == want {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("idea %s: LinkedIDs = %#v, want to contain %q", c.id, got.LinkedIDs, want)
+			}
+		}
+	}
+}
+
+// SQLite rejects "IN ()" outright, so an empty result set is the trap case
+// for the batching fix — this must not error.
+func TestListOnEmptyDatabaseReturnsEmptySliceWithoutError(t *testing.T) {
+	svc, ctx := newService(t)
+
+	got, err := svc.List(ctx, ideas.ListFilter{})
+	if err != nil {
+		t.Fatalf("List on empty db must not error, got %v", err)
+	}
+	if got == nil {
+		t.Error("List on empty db should return an empty slice, not nil")
+	}
+	if len(got) != 0 {
+		t.Errorf("len = %d, want 0", len(got))
+	}
+}
+
+// Every idea List returns must have non-nil relation fields even when it
+// has none of them — the frontend maps over Notes/LinkedIDs/Metadata.Tags
+// without a null guard, same invariant already enforced for Equipment and
+// FieldOverrides.
+func TestListNeverReturnsNilRelationFields(t *testing.T) {
+	svc, ctx := newService(t)
+
+	if _, err := svc.Create(ctx, "Bare idea, no relations at all", ideas.SourceWeb, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := svc.List(ctx, ideas.ListFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected exactly 1 idea, got %d", len(list))
+	}
+	got := list[0]
+	if got.Notes == nil {
+		t.Error("Notes is nil, want non-nil empty slice")
+	}
+	if got.LinkedIDs == nil {
+		t.Error("LinkedIDs is nil, want non-nil empty slice")
+	}
+	if got.Metadata.Tags == nil {
+		t.Error("Metadata.Tags is nil, want non-nil empty slice")
+	}
+}
+
 func TestMergeUnionsAndTombstones(t *testing.T) {
 	svc, ctx := newService(t)
 

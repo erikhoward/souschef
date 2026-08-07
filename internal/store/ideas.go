@@ -300,6 +300,7 @@ func scanIdea(sc scanner) (ideas.Idea, error) {
 
 	i.Notes = []ideas.Note{}
 	i.LinkedIDs = []string{}
+	i.Metadata.Tags = []string{}
 	return i, nil
 }
 
