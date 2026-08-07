@@ -240,7 +240,7 @@ This is the direct fix for the prior incident where a dead key surfaced as an in
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `config.Config` struct; `config.Load() (Config, error)`; `config.ErrMissing` sentinel. Fields used by later tasks: `DBPath`, `Port`, `Model`, `Effort`, `AnthropicKey`, `TelegramToken`, `TelegramChatID int64`, `WhisperBin`, `WhisperModel`, `AudioDir`.
+- Produces: `config.Config` struct; `config.Load() (Config, error)` returning one joined error listing every problem — no sentinel, because no caller distinguishes categories. Fields used by later tasks: `DBPath`, `Port`, `Model`, `Effort`, `AnthropicKey`, `TelegramToken`, `TelegramChatID int64`, `WhisperBin`, `WhisperModel`, `AudioDir`.
 
 - [ ] **Step 1: Write the failing test**
 
