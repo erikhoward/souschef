@@ -59,11 +59,14 @@ kbd { padding: 2px 5px; border: 1px solid rgb(255 255 255 / .36); border-radius:
 .capture-heading { display: flex; align-items: baseline; gap: 14px; }
 .capture-heading h2 { font-size: 23px; letter-spacing: -.035em; }
 .capture-heading span { color: var(--muted); font-size: 12px; }
-.capture-control { margin-top: 13px; display: grid; grid-template-columns: minmax(0, 1fr) 170px; gap: 16px; align-items: end; }
+/* Actions sit BELOW the input, not beside it: the textarea gets the full
+ * width, and the button lands where your eye already is after typing. Used by
+ * both the capture composer and the note form. */
+.capture-control { margin-top: 13px; display: grid; gap: 10px; }
 .capture-control textarea { height: 91px; width: 100%; padding: 13px; border: 1px solid var(--border-strong); border-radius: 5px; resize: vertical; outline: 0; background: var(--surface); color: var(--text); font-size: 14px; line-height: 1.45; }
 .capture-control textarea::placeholder { color: var(--faint); }
-.capture-actions { display: grid; gap: 11px; justify-items: stretch; }
-.capture-actions small { color: var(--muted); text-align: right; font-size: 11px; }
+.capture-actions { display: flex; align-items: center; justify-content: flex-end; gap: 14px; }
+.capture-actions small { color: var(--muted); font-size: 11px; }
 
 .filter-bar { min-height: 59px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: stretch; gap: 15px; }
 .filter-tabs { display: flex; gap: 13px; }
@@ -186,7 +189,11 @@ kbd { padding: 2px 5px; border: 1px solid rgb(255 255 255 / .36); border-radius:
 .inspector-pending { border-color: var(--border-strong); background: var(--surface-alt); }
 .inspector-pending strong { display: block; color: var(--text); font-size: 12px; }
 .inspector-pending p { margin: 6px 0 11px; color: var(--muted); font-size: 11px; line-height: 1.4; }
-.notes-input { width: 100%; min-height: 66px; margin-top: 12px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); resize: vertical; color: var(--muted); background: var(--surface); font-size: 11px; line-height: 1.4; }
+/* Notes are prose you come back to, so give them room to be read and edited
+ * rather than a one-line slot. */
+/* height: auto is load-bearing — `.capture-control textarea` above sets a
+ * fixed 91px and outranks this rule on specificity. */
+.notes-input { width: 100%; height: auto; min-height: 132px; margin-top: 12px; padding: 11px; border: 1px solid var(--border); border-radius: var(--radius-sm); resize: vertical; color: var(--text); background: var(--surface); font-size: 13px; line-height: 1.5; }
 .related-list { margin-top: 12px; display: grid; gap: 9px; }
 .related-list button { padding: 0; border: 0; display: flex; align-items: center; gap: 10px; color: var(--text); background: transparent; text-align: left; font-size: 11px; }
 .related-list button:hover span:first-child { color: var(--accent); }
@@ -307,10 +314,9 @@ kbd { padding: 2px 5px; border: 1px solid rgb(255 255 255 / .36); border-radius:
   .capture-heading { display: block; }
   .capture-heading h2 { font-size: 22px; }
   .capture-heading span { display: block; margin-top: 5px; }
-  .capture-control { grid-template-columns: 1fr; }
+  /* The base rules are already a single column with right-aligned actions,
+   * so mobile only needs a shorter composer. */
   .capture-control textarea { height: 78px; }
-  .capture-actions { display: flex; align-items: center; justify-content: space-between; }
-  .capture-actions small { order: 2; }
   .filter-bar { display: block; overflow: auto; }
   .filter-tabs { min-width: max-content; gap: 14px; }
   .filter-tabs button { min-height: 50px; }
