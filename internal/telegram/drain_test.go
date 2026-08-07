@@ -118,6 +118,12 @@ func TestDrainWaitsForInFlightEnrichmentBeforeStoreCloses(t *testing.T) {
 		if idea.Metadata.Cuisine != "Test" {
 			t.Errorf("Cuisine = %q, enrichment result did not persist", idea.Metadata.Cuisine)
 		}
+		// The Telegram surface must attribute the enriching model exactly as
+		// the web surface does — otherwise an idea's attribution would depend
+		// on where it happened to be captured, and it cannot be backfilled.
+		if idea.Enrichment.Model != "test-model" {
+			t.Errorf("Enrichment.Model = %q, want %q", idea.Enrichment.Model, "test-model")
+		}
 	}
 	if !found {
 		t.Fatal("the captured idea is missing from the store")

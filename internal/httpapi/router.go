@@ -21,6 +21,10 @@ import (
 // here keeps HTTP tests runnable with a stub and no API key.
 type Enricher interface {
 	Enrich(ctx context.Context, rawText string) (ideas.Metadata, error)
+	// Model names the model doing the classifying. It is recorded on every
+	// enriched idea so a later model change can find and re-run exactly the
+	// ideas the old one classified.
+	Model() string
 }
 
 type Deps struct {
@@ -204,7 +208,7 @@ func (s *Server) enrichOnce(ctx context.Context, id, rawText string) (ideas.Idea
 	if err != nil {
 		return s.ideas.RecordEnrichmentFailure(ctx, id, err.Error())
 	}
-	return s.ideas.ApplyEnrichment(ctx, id, meta, "")
+	return s.ideas.ApplyEnrichment(ctx, id, meta, s.enricher.Model())
 }
 
 func (s *Server) reenrichIdea(w http.ResponseWriter, r *http.Request) {

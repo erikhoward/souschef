@@ -34,6 +34,8 @@ func (e slowEnricher) Enrich(ctx context.Context, rawText string) (ideas.Metadat
 	}, nil
 }
 
+func (e slowEnricher) Model() string { return "claude-stub-5" }
+
 // TestDrainWaitsForInFlightEnrichmentBeforeStoreCloses proves the shutdown
 // sequencing this task exists to fix: EnrichInBackground detaches a
 // goroutine with no tracking of its own, so a naive shutdown can close the

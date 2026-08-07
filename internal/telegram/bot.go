@@ -14,6 +14,10 @@ import (
 
 type Enricher interface {
 	Enrich(ctx context.Context, rawText string) (ideas.Metadata, error)
+	// Model names the model doing the classifying, recorded on every idea it
+	// enriches. See httpapi.Enricher — the two surfaces must agree, or an
+	// idea's attribution would depend on where it was captured.
+	Model() string
 }
 
 type Transcriber interface {
@@ -249,7 +253,7 @@ func (b *Bot) enrichAndEdit(ideaID, rawText string, messageID int64) {
 	if err != nil {
 		updated, err = b.Ideas.RecordEnrichmentFailure(ctx, ideaID, err.Error())
 	} else {
-		updated, err = b.Ideas.ApplyEnrichment(ctx, ideaID, meta, "")
+		updated, err = b.Ideas.ApplyEnrichment(ctx, ideaID, meta, b.Enricher.Model())
 	}
 	if err != nil {
 		log.Printf("telegram: record enrichment for %s: %v", ideaID, err)

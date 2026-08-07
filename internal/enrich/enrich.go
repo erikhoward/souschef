@@ -165,6 +165,14 @@ func New(model, effort string) *Enricher {
 	return &Enricher{client: anthropic.NewClient(), model: model, effort: effort}
 }
 
+// Model reports which model this enricher classifies with, so callers can
+// record it on the ideas it enriches. Attribution is not decoration: when the
+// model changes, it is the only way to find the ideas the old one classified
+// and re-run just those, instead of rescanning the whole backlog. It cannot
+// be backfilled after the fact, which is why it is written at enrichment
+// time rather than derived later.
+func (e *Enricher) Model() string { return e.model }
+
 const (
 	enrichTimeout = 60 * time.Second
 	maxAttempts   = 3

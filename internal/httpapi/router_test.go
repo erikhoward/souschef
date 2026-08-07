@@ -27,6 +27,13 @@ func (s stubEnricher) Enrich(context.Context, string) (ideas.Metadata, error) {
 	return s.meta, s.err
 }
 
+// stubModel is what an enriched idea must be attributed to. It is a distinct,
+// recognisable string so a test can tell "the model was recorded" apart from
+// "some default happened to be there".
+const stubModel = "claude-stub-5"
+
+func (s stubEnricher) Model() string { return stubModel }
+
 func newTestServer(t *testing.T, e httpapi.Enricher) http.Handler {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
@@ -266,5 +273,13 @@ func TestReenrichSuccessAppliesMetadata(t *testing.T) {
 	}
 	if got.Metadata.Cuisine != "Middle Eastern" {
 		t.Errorf("Cuisine = %q", got.Metadata.Cuisine)
+	}
+	// Attribution cannot be reconstructed after the fact: an idea enriched
+	// without it permanently lacks any record of which model classified it,
+	// so a later model change has no way to find just those ideas and re-run
+	// them short of rescanning the whole backlog.
+	if got.Enrichment.Model != stubModel {
+		t.Errorf("Enrichment.Model = %q, want %q — the enriching model must be recorded on the row",
+			got.Enrichment.Model, stubModel)
 	}
 }
