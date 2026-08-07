@@ -2866,13 +2866,679 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
+## Task 7: Claude enrichment
+
+The package is split into a pure core and a thin I/O shell. `ParseResponse`
+and `Classify` are ordinary functions over bytes and errors, so the taxonomy
+and the failure handling stay covered by tests that run offline with no API
+key — the exact condition that made the previous incident hard to diagnose.
+
+**Files:**
+- Create: `internal/enrich/prompt.go`, `internal/enrich/enrich.go`, `internal/enrich/enrich_test.go`
+- Create: `internal/enrich/testdata/valid.json`, `internal/enrich/testdata/partial.json`, `internal/enrich/testdata/bad_enum.json`, `internal/enrich/testdata/malformed.json`
+
+**Interfaces:**
+- Consumes: `ideas.Metadata` from Task 4; `config.Config.Model` and `.Effort` from Task 2.
+- Produces:
+  - `enrich.New(model, effort string) *Enricher`
+  - `(*Enricher).Enrich(ctx, rawText string) (ideas.Metadata, error)`
+  - `enrich.ParseResponse(b []byte) (ideas.Metadata, error)` — pure
+  - `enrich.Classify(err error) Failure` — pure
+  - `enrich.Failure{Message string; Retryable bool}`
+  - `enrich.SystemPrompt` string constant
+  - `enrich.MetadataSchema` map — the JSON schema sent as `output_config.format`
+
+- [ ] **Step 1: Add the SDK**
+
+```bash
+go get github.com/anthropics/anthropic-sdk-go@latest
+```
+
+- [ ] **Step 2: Write the fixtures**
+
+Create `internal/enrich/testdata/valid.json`:
+
+```json
+{
+  "title": "Crispy chili eggs with scallion oil",
+  "difficulty": "easy",
+  "duration_class": "quick",
+  "treatment": "elevated",
+  "content_type": "recipe",
+  "cuisine": "Chinese-inspired",
+  "primary_ingredient": "Eggs",
+  "equipment": ["wok", "slotted spoon"],
+  "visual_potential": "high",
+  "seasonality": "all_year",
+  "production_effort": "light",
+  "tags": ["weeknight", "fast", "crispy"]
+}
+```
+
+Create `internal/enrich/testdata/partial.json` — a valid response that omits optional fields:
+
+```json
+{
+  "title": "Something vague I mumbled",
+  "difficulty": "moderate",
+  "duration_class": "average",
+  "treatment": "non_elevated",
+  "content_type": "recipe",
+  "cuisine": "",
+  "primary_ingredient": "",
+  "equipment": [],
+  "visual_potential": "medium",
+  "seasonality": "all_year",
+  "production_effort": "average",
+  "tags": []
+}
+```
+
+Create `internal/enrich/testdata/bad_enum.json` — schema-shaped but with a value outside the taxonomy:
+
+```json
+{
+  "title": "Wrong enum",
+  "difficulty": "trivial",
+  "duration_class": "quick",
+  "treatment": "elevated",
+  "content_type": "recipe",
+  "cuisine": "Italian",
+  "primary_ingredient": "Pasta",
+  "equipment": [],
+  "visual_potential": "high",
+  "seasonality": "all_year",
+  "production_effort": "light",
+  "tags": []
+}
+```
+
+Create `internal/enrich/testdata/malformed.json`:
+
+```
+{"title": "unterminated
+```
+
+- [ ] **Step 3: Write the failing test**
+
+Create `internal/enrich/enrich_test.go`:
+
+```go
+package enrich
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func fixture(t *testing.T, name string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	return b
+}
+
+func TestParseResponseValid(t *testing.T) {
+	got, err := ParseResponse(fixture(t, "valid.json"))
+	if err != nil {
+		t.Fatalf("ParseResponse: %v", err)
+	}
+	if got.Title != "Crispy chili eggs with scallion oil" {
+		t.Errorf("Title = %q", got.Title)
+	}
+	if got.Difficulty != "easy" || got.DurationClass != "quick" {
+		t.Errorf("difficulty/duration = %q/%q", got.Difficulty, got.DurationClass)
+	}
+	if len(got.Equipment) != 2 || got.Equipment[0] != "wok" {
+		t.Errorf("Equipment = %v", got.Equipment)
+	}
+	if len(got.Tags) != 3 {
+		t.Errorf("Tags = %v, want 3", got.Tags)
+	}
+}
+
+func TestParseResponseAcceptsEmptyOptionalFields(t *testing.T) {
+	got, err := ParseResponse(fixture(t, "partial.json"))
+	if err != nil {
+		t.Fatalf("a response with empty optional fields must parse: %v", err)
+	}
+	if got.Cuisine != "" || got.PrimaryIngredient != "" {
+		t.Error("empty strings should stay empty, not be defaulted")
+	}
+	if got.Difficulty != "moderate" {
+		t.Errorf("Difficulty = %q", got.Difficulty)
+	}
+}
+
+// A model can return well-formed JSON containing a value outside our
+// taxonomy. Storing "trivial" as a difficulty would silently corrupt every
+// filter and sort downstream, so it must be rejected here.
+func TestParseResponseRejectsValueOutsideTaxonomy(t *testing.T) {
+	_, err := ParseResponse(fixture(t, "bad_enum.json"))
+	if err == nil {
+		t.Fatal("expected rejection of difficulty=trivial")
+	}
+	if !strings.Contains(err.Error(), "difficulty") {
+		t.Errorf("error should name the offending field, got: %v", err)
+	}
+}
+
+func TestParseResponseRejectsMalformedJSON(t *testing.T) {
+	if _, err := ParseResponse(fixture(t, "malformed.json")); err == nil {
+		t.Fatal("expected error for malformed JSON")
+	}
+}
+
+func TestParseResponseRejectsEmptyTitle(t *testing.T) {
+	_, err := ParseResponse([]byte(`{"title":"","difficulty":"easy","duration_class":"quick",
+		"treatment":"elevated","content_type":"recipe","visual_potential":"high",
+		"seasonality":"all_year","production_effort":"light"}`))
+	if err == nil {
+		t.Fatal("title is the one field we require; empty must be rejected")
+	}
+}
+
+func TestClassifyAuthFailureIsNotRetryable(t *testing.T) {
+	got := Classify(&stubAPIError{status: 401, msg: "invalid x-api-key", requestID: "req_abc"})
+
+	if got.Retryable {
+		t.Error("a 401 must not be retried — the key will not fix itself")
+	}
+	for _, want := range []string{"401", "invalid x-api-key", "req_abc"} {
+		if !strings.Contains(got.Message, want) {
+			t.Errorf("message %q should contain %q", got.Message, want)
+		}
+	}
+}
+
+func TestClassifyRateLimitIsRetryable(t *testing.T) {
+	got := Classify(&stubAPIError{status: 429, msg: "rate_limit_error"})
+	if !got.Retryable {
+		t.Error("429 should be retryable")
+	}
+	if !strings.Contains(got.Message, "429") {
+		t.Errorf("message must carry the status code, got %q", got.Message)
+	}
+}
+
+func TestClassifyServerErrorIsRetryable(t *testing.T) {
+	if !Classify(&stubAPIError{status: 529, msg: "overloaded_error"}).Retryable {
+		t.Error("529 should be retryable")
+	}
+	if !Classify(&stubAPIError{status: 500, msg: "api_error"}).Retryable {
+		t.Error("500 should be retryable")
+	}
+}
+
+func TestClassifyNonAPIErrorStillProducesMessage(t *testing.T) {
+	got := Classify(errors.New("dial tcp: lookup api.anthropic.com: no such host"))
+	if got.Message == "" {
+		t.Fatal("a transport error must still produce a message for the row")
+	}
+	if !got.Retryable {
+		t.Error("transport errors should be retryable")
+	}
+}
+
+func TestClassifyNilIsNotAFailure(t *testing.T) {
+	if got := Classify(nil); got.Message != "" {
+		t.Errorf("Classify(nil) should be zero, got %+v", got)
+	}
+}
+
+func TestSystemPromptCoversEveryTaxonomyValue(t *testing.T) {
+	// If a value exists in the schema, the prompt must define it — otherwise
+	// the model is guessing at what we mean.
+	for _, v := range []string{
+		"easy", "moderate", "insane",
+		"quick", "average", "multi_day",
+		"elevated", "non_elevated",
+		"recipe", "vlog",
+		"light", "heavy",
+	} {
+		if !strings.Contains(SystemPrompt, v) {
+			t.Errorf("SystemPrompt does not mention taxonomy value %q", v)
+		}
+	}
+}
+```
+
+Add the stub error to the same file:
+
+```go
+// stubAPIError mimics the shape Classify inspects. The real SDK error type is
+// substituted in Step 5 once the exact field names are confirmed against the
+// compiler; this keeps the pure logic testable either way.
+type stubAPIError struct {
+	status    int
+	msg       string
+	requestID string
+}
+
+func (e *stubAPIError) Error() string  { return e.msg }
+func (e *stubAPIError) StatusCode() int { return e.status }
+func (e *stubAPIError) RequestID() string { return e.requestID }
+```
+
+- [ ] **Step 4: Run it to make sure it fails**
+
+Run: `go test ./internal/enrich/ -v`
+Expected: FAIL — `undefined: ParseResponse`
+
+- [ ] **Step 5: Write the taxonomy prompt**
+
+Create `internal/enrich/prompt.go`:
+
+```go
+package enrich
+
+// SystemPrompt defines the taxonomy. It is byte-identical on every call, which
+// makes it the correct cache_control target.
+//
+// Note the 1024-token minimum cacheable prefix on Sonnet 5: below it, caching
+// silently does nothing and reports cache_creation_input_tokens: 0 with no
+// error. Verify usage.cache_read_input_tokens against a real call rather than
+// assuming the marker took effect.
+const SystemPrompt = `You classify recipe and video ideas for a food content creator.
+
+You will be given a raw, unpolished capture — often dictated, often a fragment.
+Infer structured metadata from it. Never invent detail the text does not
+support: when a field is genuinely unknowable from the input, return an empty
+string for it rather than guessing.
+
+TAXONOMY
+
+difficulty — how hard the technique is, not how long it takes:
+  easy      Routine technique. Nothing that can go badly wrong.
+  moderate  Requires attention or timing. A distracted cook could ruin it.
+  insane    Specialist technique, long chains of dependent steps, or a high
+            failure rate even when done carefully.
+
+duration_class — wall-clock from starting to eating:
+  quick      Under 30 minutes.
+  average    30 minutes to about 3 hours.
+  multi_day  Requires overnight resting, fermenting, curing, or brining.
+
+treatment:
+  elevated      A restaurant-leaning take: refined technique, plating, or an
+                unexpected ingredient pairing.
+  non_elevated  Straightforward home cooking, presented plainly.
+
+content_type:
+  recipe  Produces a dish with a repeatable method.
+  vlog    Process, day-in-the-life, or commentary with no reproducible recipe.
+
+visual_potential — how well it will film:
+  high    Strong visual moments: sizzle, char, pull, pour, melt, steam.
+  medium  Looks good but undramatic.
+  low     Tastes better than it looks.
+
+production_effort — the burden on the creator, not the cook:
+  light    One setup, minimal prep, few shots.
+  average  Some prep staging and a couple of camera setups.
+  heavy    Multiple setups, long shoots, or significant cleanup.
+
+seasonality: spring, summer, fall, winter, or all_year when it is not
+seasonal.
+
+cuisine: a short label such as "Middle Eastern" or "Chinese-inspired". Prefer
+"-inspired" when the dish borrows a technique without claiming authenticity.
+Empty string if the text gives no signal.
+
+primary_ingredient: the single ingredient the dish is about, capitalised.
+Empty string if unclear.
+
+equipment: specific equipment the method requires. Omit ordinary items such as
+a knife, bowl, or stovetop. Empty array when nothing notable is needed.
+
+tags: 2 to 5 short lowercase keywords for later retrieval. Prefer words the
+creator would actually search for.
+
+title: a clean, specific title in the creator's voice — dry, competent,
+quietly enthusiastic. Never sarcastic, never exclamatory, no generational
+references, no wordplay for its own sake. Under 60 characters.`
+```
+
+- [ ] **Step 6: Write the implementation**
+
+Create `internal/enrich/enrich.go`:
+
+```go
+// Package enrich turns raw capture text into structured metadata using Claude.
+//
+// It never touches the database. Enrich is a function from text to metadata,
+// which makes the expensive, nondeterministic, key-requiring part of the
+// system replayable from fixtures in tests.
+package enrich
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/erikhoward/souschef/internal/ideas"
+)
+
+// taxonomy lists the permitted values per enum field. It is the single source
+// of truth for both the JSON schema we send and the validation we apply on
+// the way back — a model can return well-formed JSON with a value we never
+// asked for, and storing it would corrupt every filter downstream.
+var taxonomy = map[string][]string{
+	"difficulty":        {"easy", "moderate", "insane"},
+	"duration_class":    {"quick", "average", "multi_day"},
+	"treatment":         {"elevated", "non_elevated"},
+	"content_type":      {"recipe", "vlog"},
+	"visual_potential":  {"low", "medium", "high"},
+	"seasonality":       {"spring", "summer", "fall", "winter", "all_year"},
+	"production_effort": {"light", "average", "heavy"},
+}
+
+func enumProp(field string) map[string]any {
+	return map[string]any{"type": "string", "enum": taxonomy[field]}
+}
+
+// MetadataSchema is sent as output_config.format. Note the deprecated
+// top-level output_format parameter is not used anywhere.
+var MetadataSchema = map[string]any{
+	"type": "object",
+	"properties": map[string]any{
+		"title":              map[string]any{"type": "string"},
+		"difficulty":         enumProp("difficulty"),
+		"duration_class":     enumProp("duration_class"),
+		"treatment":          enumProp("treatment"),
+		"content_type":       enumProp("content_type"),
+		"cuisine":            map[string]any{"type": "string"},
+		"primary_ingredient": map[string]any{"type": "string"},
+		"equipment":          map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		"visual_potential":   enumProp("visual_potential"),
+		"seasonality":        enumProp("seasonality"),
+		"production_effort":  enumProp("production_effort"),
+		"tags":               map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+	},
+	"required": []string{
+		"title", "difficulty", "duration_class", "treatment", "content_type",
+		"visual_potential", "seasonality", "production_effort",
+	},
+	"additionalProperties": false,
+}
+
+func allowed(field, value string) bool {
+	for _, v := range taxonomy[field] {
+		if v == value {
+			return true
+		}
+	}
+	return false
+}
+
+// ParseResponse decodes and validates a model response. It is pure — every
+// taxonomy test runs against recorded fixtures with no network and no key.
+func ParseResponse(b []byte) (ideas.Metadata, error) {
+	var m ideas.Metadata
+	if err := json.Unmarshal(b, &m); err != nil {
+		return ideas.Metadata{}, fmt.Errorf("decode metadata: %w", err)
+	}
+
+	if strings.TrimSpace(m.Title) == "" {
+		return ideas.Metadata{}, errors.New("metadata: title must not be empty")
+	}
+
+	for field, value := range map[string]string{
+		"difficulty":        m.Difficulty,
+		"duration_class":    m.DurationClass,
+		"treatment":         m.Treatment,
+		"content_type":      m.ContentType,
+		"visual_potential":  m.VisualPotential,
+		"seasonality":       m.Seasonality,
+		"production_effort": m.ProductionEffort,
+	} {
+		if !allowed(field, value) {
+			return ideas.Metadata{}, fmt.Errorf(
+				"metadata: %s = %q is outside the taxonomy (allowed: %s)",
+				field, value, strings.Join(taxonomy[field], ", "))
+		}
+	}
+
+	if m.Equipment == nil {
+		m.Equipment = []string{}
+	}
+	if m.Tags == nil {
+		m.Tags = []string{}
+	}
+	return m, nil
+}
+
+// Failure is a classified enrichment error, ready to be written to the row.
+type Failure struct {
+	Message   string
+	Retryable bool
+}
+
+// statusCarrier is satisfied by the SDK's error type and by the test stub.
+type statusCarrier interface {
+	Error() string
+	StatusCode() int
+}
+
+type requestIDCarrier interface{ RequestID() string }
+
+// Classify turns any error into a message for the idea row and a retry
+// decision. Nothing is swallowed: a transport failure with no status still
+// produces text a human can act on.
+func Classify(err error) Failure {
+	if err == nil {
+		return Failure{}
+	}
+
+	var sc statusCarrier
+	if errors.As(err, &sc) {
+		msg := fmt.Sprintf("%d %s", sc.StatusCode(), sc.Error())
+
+		var rc requestIDCarrier
+		if errors.As(err, &rc) && rc.RequestID() != "" {
+			msg += fmt.Sprintf(" (request_id=%s)", rc.RequestID())
+		}
+
+		switch code := sc.StatusCode(); {
+		case code == 401 || code == 403:
+			// The key is wrong or unauthorized. Retrying cannot help, and
+			// retrying quietly is how this became invisible last time.
+			return Failure{Message: msg, Retryable: false}
+		case code == 400 || code == 404 || code == 413:
+			return Failure{Message: msg, Retryable: false}
+		case code == 429 || code >= 500:
+			return Failure{Message: msg, Retryable: true}
+		default:
+			return Failure{Message: msg, Retryable: false}
+		}
+	}
+
+	return Failure{Message: err.Error(), Retryable: true}
+}
+
+type Enricher struct {
+	client anthropic.Client
+	model  string
+	effort string
+}
+
+// New builds an Enricher. The client resolves credentials itself: an
+// ANTHROPIC_API_KEY, an ANTHROPIC_AUTH_TOKEN, or an `ant auth login` profile.
+func New(model, effort string) *Enricher {
+	return &Enricher{client: anthropic.NewClient(), model: model, effort: effort}
+}
+
+const (
+	enrichTimeout = 60 * time.Second
+	maxAttempts   = 3
+)
+
+// Enrich classifies rawText. On a retryable failure it backs off and tries
+// again up to maxAttempts; on a terminal failure it returns immediately.
+func (e *Enricher) Enrich(ctx context.Context, rawText string) (ideas.Metadata, error) {
+	var last error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, enrichTimeout)
+		raw, err := e.call(attemptCtx, rawText)
+		cancel()
+
+		if err == nil {
+			return ParseResponse(raw)
+		}
+		last = err
+
+		if f := Classify(err); !f.Retryable || attempt == maxAttempts {
+			return ideas.Metadata{}, err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ideas.Metadata{}, ctx.Err()
+		case <-time.After(time.Duration(attempt) * 2 * time.Second):
+		}
+	}
+	return ideas.Metadata{}, last
+}
+```
+
+- [ ] **Step 7: Write the SDK call, letting the compiler settle the type names**
+
+Append `call` to `internal/enrich/enrich.go`. **Do not research the SDK's exact
+type names first — write this, run `go build ./internal/enrich/`, and fix what
+the compiler reports.** That loop is faster than reading the repo, and the
+field names below are close enough to guide it.
+
+```go
+// call issues one request and returns the raw JSON body of the response.
+func (e *Enricher) call(ctx context.Context, rawText string) ([]byte, error) {
+	msg, err := e.client.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     anthropic.Model(e.model),
+		MaxTokens: 2048,
+
+		// The taxonomy prompt is byte-identical every call, so it is the
+		// cache target. Effort is low: this is a short, scoped classification.
+		System: []anthropic.TextBlockParam{{
+			Text:         SystemPrompt,
+			CacheControl: anthropic.NewCacheControlEphemeralParam(),
+		}},
+
+		Thinking: anthropic.ThinkingConfigParamUnion{
+			OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{},
+		},
+
+		OutputConfig: anthropic.OutputConfigParam{
+			Effort: anthropic.Effort(e.effort),
+			Format: anthropic.JSONOutputFormatParam{Schema: MetadataSchema},
+		},
+
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(rawText)),
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// A refusal arrives as HTTP 200 with an empty content array, so this must
+	// be checked before indexing into Content.
+	if msg.StopReason == anthropic.StopReasonRefusal {
+		return nil, fmt.Errorf("model declined to classify this idea")
+	}
+
+	for _, block := range msg.Content {
+		if block.Type == "text" {
+			return []byte(block.Text), nil
+		}
+	}
+	return nil, errors.New("response contained no text block")
+}
+```
+
+- [ ] **Step 8: Build and fix compiler errors**
+
+Run: `go build ./internal/enrich/`
+
+Expected: some type-name mismatches on the first pass. Fix each against the
+compiler's suggestion. Do **not** change the semantics while doing so — in
+particular keep adaptive thinking, keep `output_config.format`, and never add
+`temperature`, `top_p`, `top_k`, or `budget_tokens`. All four return 400 on
+Sonnet 5.
+
+- [ ] **Step 9: Run the tests to make sure they pass**
+
+Run: `go test ./internal/enrich/ -v`
+Expected: PASS — all eleven tests, with no API key set.
+
+- [ ] **Step 10: Record a real fixture and verify caching**
+
+This step needs a working credential. Write a throwaway `main` under
+`/tmp`, or add a temporary test guarded by an env var:
+
+```go
+func TestLiveEnrichment(t *testing.T) {
+	if os.Getenv("SOUSCHEF_LIVE_TEST") == "" {
+		t.Skip("set SOUSCHEF_LIVE_TEST=1 to exercise the real API")
+	}
+	e := New("claude-sonnet-5", "low")
+	got, err := e.Enrich(context.Background(),
+		"sheet pan shawarma with a lemony feta situation, weeknight thing")
+	if err != nil {
+		t.Fatalf("Enrich: %v", err)
+	}
+	t.Logf("%+v", got)
+	if got.Title == "" {
+		t.Error("live call returned an empty title")
+	}
+}
+```
+
+Run: `SOUSCHEF_LIVE_TEST=1 go test ./internal/enrich/ -run TestLiveEnrichment -v`
+
+Then **check the cache actually engaged.** Log `msg.Usage` from `call` and
+confirm `CacheReadInputTokens` is non-zero on the *second* consecutive run. If
+it is zero on both runs, the taxonomy prompt is under Sonnet 5's 1024-token
+minimum and `cache_control` is silently doing nothing — either accept that
+(correctness is unaffected) or lengthen the prompt with genuinely useful
+guidance. Record the finding in `PROJECT_LOG.md` either way.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add internal/enrich
+git commit -m "feat(enrich): Claude metadata inference with offline-testable core
+
+ParseResponse and Classify are pure functions over bytes and errors, so
+the taxonomy and the failure handling are covered by fixture tests that
+run with no API key and no network.
+
+Enum values are validated on the way back in: a model can return
+well-formed JSON containing a difficulty of 'trivial', and storing it
+would corrupt every filter and sort downstream.
+
+Classify refuses to retry 401/403 — a wrong key does not fix itself, and
+retrying quietly is how this failure mode became invisible last time.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
 ## Remaining tasks
 
-Tasks 7–17 follow the same structure. Deliverables:
+Tasks 8–17 follow the same structure. Deliverables:
 
 | Task | Deliverable |
 |---|---|
-| 7 | `enrich`: Claude structured output, taxonomy prompt, error classification, fixture replay |
 | 8 | `httpapi`: REST routes and JSON |
 | 9 | `httpapi`: SSE hub with reconnect |
 | 10 | `httpapi`: embed `web/dist`, single-binary serving, graceful shutdown |
